@@ -381,3 +381,254 @@ class TunedLens(Lens):
                 break
 
         return tokens
+
+@dataclass
+class LoraLensConfig:
+    """A configuration for a LoraLens (low-rank tuned lens)."""
+
+    # The name of the base model this lens was tuned for.
+    base_model_name_or_path: str
+    # The hidden size of the base model.
+    d_model: int
+    # The number of layers in the base model.
+    num_hidden_layers: int
+    # Whether to use a bias term after the low-rank affine.
+    bias: bool = True
+    # The low-rank dimension (aka r).
+    rank: int = 16
+    # The revision of the base model this lens was tuned for.
+    base_model_revision: Optional[str] = None
+    # The hash of the base's unembed model this lens was tuned for.
+    unembed_hash: Optional[str] = None
+    # The name of the lens type.
+    lens_type: str = "lora_tuned_lens"
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, config_dict: Dict):
+        config_dict = deepcopy(config_dict)
+        unrecognized = set(config_dict) - set(inspect.getfullargspec(cls).args)
+        for key in unrecognized:
+            logger.warning(f"Ignoring config key '{key}'")
+            del config_dict[key]
+        return cls(**config_dict)
+
+
+class _LowRankLinear(th.nn.Module):
+    """Low-rank affine: up(down(x)) + bias, where down: d->r, up: r->d."""
+
+    def __init__(self, d_model: int, rank: int, bias: bool = True, dtype: th.dtype = th.float32):
+        super().__init__()
+        if rank <= 0 or rank > d_model:
+            raise ValueError(f"rank must be in [1, d_model], got rank={rank}, d_model={d_model}")
+
+        # down: d_model -> rank, up: rank -> d_model
+        self.down = th.nn.Linear(d_model, rank, bias=False, dtype=dtype)
+        self.up = th.nn.Linear(rank, d_model, bias=False, dtype=dtype)
+
+        # Initialize to zero so overall map starts as identity when used residually.
+        th.nn.init.zeros_(self.down.weight)
+        th.nn.init.zeros_(self.up.weight)
+
+        self.use_bias = bias
+        if bias:
+            self.bias = th.nn.Parameter(th.zeros(d_model, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        y = self.up(self.down(x))
+        if self.use_bias:
+            y = y + self.bias
+        return y
+
+
+class LoraLens(Lens):
+    """A tuned lens that uses a low-rank (LoRA-style) approximation per layer."""
+
+    config: LoraLensConfig
+    unembed: Unembed
+    layer_translators: th.nn.ModuleList
+
+    def __init__(self, unembed: Unembed, config: LoraLensConfig):
+        """Create a LoraLens.
+
+        Args:
+            unembed: The unembed operation to use.
+            config: The configuration for this lens.
+        """
+        super().__init__(unembed)
+
+        self.config = config
+        unembed_hash = unembed.unembedding_hash()
+        config.unembed_hash = unembed_hash
+
+        # Match dtype of unembedding (may be int8 quantized; fall back to fp16)
+        w = unembed.unembedding.weight
+        dtype = w.dtype if th.is_floating_point(w) else th.float16
+
+        translator = _LowRankLinear(
+            d_model=config.d_model,
+            rank=config.rank,
+            bias=config.bias,
+            dtype=dtype,
+        )
+
+        # Don't include the final layer since it does not need a translator
+        self.layer_translators = th.nn.ModuleList(
+            [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
+        )
+
+    def __getitem__(self, item: int) -> th.nn.Module:
+        return self.layer_translators[item]
+
+    def __iter__(self) -> Generator[th.nn.Module, None, None]:
+        yield from self.layer_translators
+
+    @classmethod
+    def from_model(
+        cls,
+        model: PreTrainedModel,
+        model_revision: Optional[str] = None,
+        bias: bool = True,
+        rank: int = 16,
+    ) -> "LoraLens":
+        """Create a LoraLens from a pretrained model.
+
+        Args:
+            model: The model to create the lens from.
+            model_revision: The git revision of the model used.
+            bias: Whether to include a bias after the low-rank affine.
+            rank: Low-rank dimension r (typically small, e.g., 8–64).
+        """
+        unembed = Unembed(model)
+        config = LoraLensConfig(
+            base_model_name_or_path=model.config.name_or_path,
+            base_model_revision=model_revision,
+            d_model=model.config.hidden_size,
+            num_hidden_layers=model.config.num_hidden_layers,
+            bias=bias,
+            rank=rank,
+        )
+        return cls(unembed, config)
+
+    @classmethod
+    def from_model_and_pretrained(
+        cls,
+        model: PreTrainedModel,
+        lens_resource_id: Optional[str] = None,
+        **kwargs,
+    ) -> "LoraLens":
+        """Load a LoraLens from a folder or Hugging Face Hub resource."""
+        if lens_resource_id is None:
+            lens_resource_id = model.config.name_or_path
+        return cls.from_unembed_and_pretrained(Unembed(model), lens_resource_id, **kwargs)
+
+    @classmethod
+    def from_unembed_and_pretrained(
+        cls,
+        unembed: Unembed,
+        lens_resource_id: str,
+        **kwargs,
+    ) -> "LoraLens":
+        """Load a LoraLens from a folder or Hugging Face Hub resource."""
+        # Validate kwargs against loader
+        load_artifact_varnames = load_artifacts.load_lens_artifacts.__code__.co_varnames
+
+        config_path, ckpt_path = load_artifacts.load_lens_artifacts(
+            resource_id=lens_resource_id,
+            **{k: v for k, v in kwargs.items() if k in load_artifact_varnames},
+        )
+
+        with open(config_path, "r") as f:
+            config = LoraLensConfig.from_dict(json.load(f))
+
+        if config.unembed_hash and unembed.unembedding_hash() != config.unembed_hash:
+            logger.warning(
+                "The unembedding matrix hash does not match the lens' hash. "
+                "This lens may have been trained with a different unembedding."
+            )
+
+        lens = cls(unembed, config)
+
+        th_load_kwargs = {**{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}}
+        state = th.load(ckpt_path, **th_load_kwargs)
+
+        lens.layer_translators.load_state_dict(state)
+        return lens
+
+    def save(
+        self,
+        path: Union[Path, str],
+        ckpt: str = "params.pt",
+        config: str = "config.json",
+    ) -> None:
+        """Save the lens to a directory."""
+        path = Path(path)
+        path.mkdir(exist_ok=True, parents=True)
+        state_dict = self.layer_translators.state_dict()
+
+        th.save(state_dict, path / ckpt)
+        with open(path / config, "w") as f:
+            json.dump(self.config.to_dict(), f)
+
+    def transform_hidden(self, h: th.Tensor, idx: int) -> th.Tensor:
+        """Transform hidden state from layer `idx` using low-rank affine."""
+        return h + self[idx](h)
+
+    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+        """Transform and then decode the hidden states into logits."""
+        h = self.transform_hidden(h, idx)
+        return self.unembed.forward(h)
+
+    def __len__(self) -> int:
+        return len(self.layer_translators)
+
+    @th.inference_mode()
+    def generate(
+        self,
+        model: PreTrainedModel,
+        layer: int,
+        input_ids: th.Tensor,
+        do_sample: bool = True,
+        temp: float = 1.0,
+        max_new_tokens: int = 100,
+    ) -> th.Tensor:
+        """Generate from the LoraLens at the given layer."""
+        eos_token = model.generation_config.eos_token_id
+
+        tokens = input_ids
+        if tokens.ndim == 1:
+            tokens = tokens.unsqueeze(0)
+        batch, prompt_len = tokens.shape
+        del prompt_len
+        past_key_values = None
+        done = th.zeros(batch, dtype=th.bool)
+
+        for _ in range(max_new_tokens):
+            output = model(
+                input_ids=tokens,
+                output_hidden_states=True,
+                use_cache=True,
+                past_key_values=past_key_values,
+            )
+            past_key_values = output.past_key_values
+            hidden = output.hidden_states[layer]
+            new_hidden = hidden[:, -1, :]
+            new_logits = self.forward(new_hidden, layer)
+            if do_sample:
+                new_logits = new_logits / temp
+                probs = new_logits.softmax(dim=-1)
+                new_tokens = th.multinomial(probs, num_samples=1)
+            else:
+                new_tokens = new_logits.argmax(dim=-1, keepdim=True)
+
+            done = done | (new_tokens == eos_token)
+            new_tokens = new_tokens.masked_fill(done, eos_token)
+            tokens = th.cat([tokens, new_tokens], dim=-1)
+            if done.all():
+                break
+
+        return tokens

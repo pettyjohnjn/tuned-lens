@@ -1,0 +1,1 @@
+{"base_model_name_or_path": "gpt2", "d_model": 768, "num_hidden_layers": 12, "bias": true, "rank": 4, "base_model_revision": null, "unembed_hash": "5a58240580f01876efdb27598e88d58bf979fce0524dcd48ac67d72d7bac311e", "lens_type": "lora_tuned_lens"}

@@ -138,3 +138,14 @@ dmypy.json
 .pyre/
 .idea/workspace.xml
 .vscode/launch.json
+
+# Log Files
+submit_train.pbs.*
+
+# dataset / cache outputs
+mycachedir/
+pile/monology___pile-uncopyrighted/
+pile/*_monology___pile-uncopyrighted_*/
+**/*.arrow
+**/*.lock
+**/*.incomplete_info.lock

@@ -1,0 +1,36 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=00:05:00
+#PBS -q debug
+#PBS -l filesystems=home:grand:eagle
+#PBS -A SuperBERT
+
+# Move to the code directory
+cd ~/../../grand/SuperBERT/pettyjohnjn/tuned-lens
+
+# Load modules and activate conda environment
+module use /soft/modulefiles
+module load conda
+# If your system requires 'source' before activating:
+# source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate tuned_lens_env
+
+# Run the training
+# python -m tuned_lens train \
+#     --model.name gpt2 \
+#     --data.name val \
+#     --per_gpu_batch_size=20 \
+#     --output my_lenses/gpt2
+
+torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc-per-node=4 \
+    -m tuned_lens train \
+    --model.name gpt2 \
+    --data.name val \
+    --per_gpu_batch_size=20 \
+    --output my_lenses/gpt2-Tuned-Lens \
+    --lens-variant LORA \
+    --lora-rank 4 \
+    --precision bfloat16 \

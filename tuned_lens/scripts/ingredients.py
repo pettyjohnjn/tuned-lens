@@ -9,7 +9,7 @@ from typing import Optional, Union
 
 import torch as th
 import torch.distributed as dist
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset, DownloadMode
 from simple_parsing import field
 from torch.distributed.fsdp import (
     CPUOffload,
@@ -78,7 +78,22 @@ class Data:
             dataset = Dataset.from_json(self.name[0])
             assert isinstance(dataset, Dataset)
         else:
-            dataset = load_dataset(*self.name, split=self.split, revision=self.revision)
+            if self.name[0] == "val":
+                print("loading validation dataset")
+                dataset = load_dataset(
+                    "monology/pile-uncopyrighted",
+                    data_files={"validation": "val.jsonl.zst"},
+                    split="validation",
+                    cache_dir="./mycachedir/"
+                )
+            elif self.name[0] == "test":
+                print("loading test dataset")
+                dataset = load_dataset(
+                    "monology/pile-uncopyrighted",
+                    data_files={"test": "test.jsonl.zst"},
+                    split="test",
+                    cache_dir="./mycachedir/"
+                )
             if not isinstance(dataset, (Dataset, DatasetDict)):
                 raise ValueError(
                     "Only Dataset and DatasetDict instances are supported."

@@ -19,8 +19,9 @@ from tqdm.auto import trange
 from transformers import PreTrainedModel
 
 import tuned_lens.scripts.ingredients as ing
-from tuned_lens import TunedLens
+from tuned_lens import TunedLens, LoraLens
 from tuned_lens.utils import maybe_all_reduce, shift_labels, shift_preds
+from tuned_lens.nn.lenses import Lens
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,16 @@ class LossChoice(enum.Enum):
     CE = "ce"
     KL = "kl"
 
+class LensVariant(enum.Enum):
+    TUNED = "tuned"
+    LORA = "lora"
 
 @dataclass
 class State:
     """All of the stateful information in the training loop."""
 
     dataloader: DataLoader2
-    lens: TunedLens
+    lens: Lens
     opt: Optimizer
     scheduler: LambdaLR
     wandb_id: Optional[str]
@@ -124,38 +128,56 @@ class Train:
     loss: LossChoice = LossChoice.KL
     """Loss function to use."""
 
+    lens_variant: LensVariant = field(default=LensVariant.TUNED, alias=["--lens-variant"])
+    lora_rank: int = field(default=16, alias=["--lora-rank"])
+
     def __post_init__(self):
         """Set defaults for some fields."""
         if self.checkpoint_dir is None:
             self.checkpoint_dir = self.output / "checkpoints"
 
-    def get_lens(self, model: PreTrainedModel) -> TunedLens:
-        """Load or create a TunedLens model."""
-        if self.lens_name_or_path is None:
-            logger.info("Randomly initializing lens...")
-            lens = TunedLens.from_model(model)
+    def get_lens(self, model: PreTrainedModel) -> Lens:
+        """Load or create a lens (TunedLens or LoraLens)."""
+        if self.lens_variant == LensVariant.TUNED:
+            if self.lens_name_or_path is None:
+                logger.info("Randomly initializing TunedLens...")
+                lens = TunedLens.from_model(model)
+            else:
+                logger.info("Loading pretrained TunedLens...")
+                lens = TunedLens.from_model_and_pretrained(model, self.lens_name_or_path)
+        elif self.lens_variant == LensVariant.LORA:
+            if self.lens_name_or_path is None:
+                logger.info(f"Randomly initializing LoraLens (rank={self.lora_rank})...")
+                lens = LoraLens.from_model(model, rank=self.lora_rank)
+            else:
+                logger.info("Loading pretrained LoraLens...")
+                lens = LoraLens.from_model_and_pretrained(model, self.lens_name_or_path)
         else:
-            logger.info("Loading pretrained lens...")
-            lens = TunedLens.from_model_and_pretrained(model, self.lens_name_or_path)
+            raise ValueError(f"Unknown lens_variant {self.lens_variant}")
 
         dtypes = {p.dtype for p in lens.parameters()}
-        assert (
-            len(dtypes) == 1
-        ), f"Expected all parameters to have the same dtype, got {dtypes}"
-
+        assert len(dtypes) == 1, f"Expected all parameters to have the same dtype, got {dtypes}"
         lens_dtype = next(iter(dtypes))
         lens_size = sum(p.numel() * p.element_size() for p in lens.parameters())
-
-        # Include the optimizer state in the memory usage
         num_bytes = lens_size * (self.opt.per_parameter_optim_state_size() + 1)
-        logger.info(
-            f"Tuned lens memory usage: {num_bytes / 2 ** 20:.2f} MB in {lens_dtype}"
-        )
+        logger.info(f"Lens memory usage: {num_bytes / 2 ** 20:.2f} MB in {lens_dtype}")
 
         if self.bias_only:
-            logger.info("Freezing the matrix weights to train only the bias terms.")
+            logger.info("Freezing non-bias parameters (bias-only training).")
             for probe in lens:
-                probe.weight.requires_grad_(False)
+                # TunedLens: probe is nn.Linear(d,d)
+                if isinstance(probe, th.nn.Linear):
+                    probe.weight.requires_grad_(False)
+                    if probe.bias is not None:
+                        probe.bias.requires_grad_(True)
+                else:
+                    # LoraLens: probe is _LowRankLinear with .down, .up, and optional .bias
+                    if hasattr(probe, "down"):
+                        probe.down.weight.requires_grad_(False)
+                    if hasattr(probe, "up"):
+                        probe.up.weight.requires_grad_(False)
+                    if hasattr(probe, "bias") and probe.bias is not None:
+                        probe.bias.requires_grad_(True)
 
         return lens
 
@@ -208,26 +230,29 @@ class Train:
             name = "input" if i == 0 else f"{i - 1}.ffn"
             states = [opt.state[p] for p in probe.parameters()]
 
-            # Approximate the true grad norm using the optimizer's moving
-            # avg
             corr = 1 - self.opt.momentum**step
             if self.opt.optimizer == "sgd" and not self.opt.zero:
                 log_dict["grad_norm/" + name] = th.cat(
-                    [
-                        # Undo PyTorch's scaling of the gradient by
-                        # 1 / (1 - β)
-                        (1 - self.opt.momentum) * s["momentum_buffer"].flatten() / corr
-                        for s in states
-                    ]
+                    [(1 - self.opt.momentum) * s["momentum_buffer"].flatten() / corr
+                     for s in states if "momentum_buffer" in s]
                 ).norm()
             elif self.opt.optimizer == "adam" and not self.opt.zero:
                 log_dict["grad_norm/" + name] = th.cat(
-                    [s["exp_avg"].flatten() / corr for s in states]
+                    [s["exp_avg"].flatten() / corr for s in states if "exp_avg" in s]
                 ).norm()
 
+            # Parameter norms by probe type
             if isinstance(probe, th.nn.Linear):
                 log_dict["bias_norm/" + name] = probe.bias.data.norm()
                 log_dict["weight_norm/" + name] = probe.weight.data.norm()
+            else:
+                # LoRA-style low-rank: up/down (no internal bias) + optional output bias
+                if hasattr(probe, "down"):
+                    log_dict["down_weight_norm/" + name] = probe.down.weight.data.norm()
+                if hasattr(probe, "up"):
+                    log_dict["up_weight_norm/" + name] = probe.up.weight.data.norm()
+                if hasattr(probe, "bias") and probe.bias is not None:
+                    log_dict["bias_norm/" + name] = probe.bias.data.norm()
 
         wandb.log(log_dict)
 
@@ -375,7 +400,14 @@ class Train:
         # Load model, tokenizer, data, and lens
         state, model, grad_acc_steps = self.setup()
 
-        losses = defaultdict(list)
+        # Enable TF32 for matmuls (safe with bf16)
+        if th.cuda.is_available():
+            th.backends.cuda.matmul.allow_tf32 = True
+            try:
+                th.set_float32_matmul_precision("high")
+            except AttributeError:
+                pass  # older PyTorch
+
         init_batches = state.step * grad_acc_steps
         total_batches = self.num_steps * grad_acc_steps
 
@@ -391,84 +423,108 @@ class Train:
             initial=init_batches,
             total=total_batches,
         )
-        # TODO this currently silently fails if the dataloader is exhausted
-        for batch_idx, batch in zip(t, state.dataloader):
-            assert isinstance(batch, dict), f"Expected dict, got {type(batch)}"
 
+        # Per-rank lightweight running stats for this optimizer window
+        running_loss_sum = None  # tensor on device
+        running_loss_count = 0
+
+        # Track peak memory without resetting (primary only)
+        last_reported_peak_bytes = 0
+
+        for batch_idx, batch in zip(t, state.dataloader):
+            # --- model forward (no autograd at all) ---
             with th.no_grad():
                 batch = self.dist.send_to_device(batch)
                 output = model(**batch, output_hidden_states=True)
 
+            # Extract and free large containers early
             final_logits = output.logits
-            hidden_states = output.hidden_states[:-1]
+            hidden_states = output.hidden_states[:-1]  # list[Tensor]
+            del output  # free the container ASAP
 
-            shift = self.token_shift
+            # Prepare labels once
             if self.loss == LossChoice.CE:
-                labels = batch["input_ids"]
-
-                # Predict the *next* token by default w/ cross entropy
-                if shift is None:
-                    shift = 1
-            elif self.loss == LossChoice.KL:
-                labels = final_logits.float().log_softmax(dim=-1)
-
-                # Match the *current* token distribution by default
-                if shift is None:
-                    shift = 0
+                shift = 1 if self.token_shift is None else self.token_shift
+                labels = shift_labels(batch["input_ids"], shift)
+                del final_logits
             else:
-                raise NotImplementedError(f"Unknown loss {self.loss}")
+                # Teacher log-probs once (float32 for stability), then free logits
+                teacher_logprobs = final_logits.float().log_softmax(dim=-1)
+                del final_logits
+                teacher_logprobs = teacher_logprobs.to(th.bfloat16)
+                shift = 0 if self.token_shift is None else self.token_shift
+                labels = shift_labels(teacher_logprobs, shift)
+                # Optional memory saver:
+                # labels = labels.to(th.bfloat16)
 
-            labels = shift_labels(labels, shift)
-
-            # We do this sequentially to save VRAM
+            # --- lens forward + loss ---
+            # Backprop PER LAYER to lower peak memory
             for i, h in enumerate(hidden_states):
-                # We use bfloat16 because it has a larger dynamic range than float16
-                # and it seems to remove the need for doing grad scaling, which is very
-                # annoying to set up in the context of multiple backward passes.
                 with th.autocast(self.dist.device.type, dtype=th.bfloat16):
-                    logits = shift_preds(state.lens(h, idx=i), shift)
+                    preds = shift_preds(state.lens(h, idx=i), shift)
 
                     if self.loss == LossChoice.CE:
-                        loss = th.nn.functional.cross_entropy(
-                            logits.flatten(0, -2), labels.flatten()
+                        loss_i = th.nn.functional.cross_entropy(
+                            preds.flatten(0, -2), labels.flatten()
                         )
-                    elif self.loss == LossChoice.KL:
-                        loss = th.sum(
-                            labels.exp() * (labels - logits.log_softmax(-1)), dim=-1
-                        ).mean()
                     else:
-                        raise NotImplementedError
+                        # KL(P||Q) where labels are log P (teacher)
+                        logp_pred = preds.log_softmax(-1)
+                        loss_i = th.sum(labels.exp() * (labels - logp_pred), dim=-1).mean()
 
-                    logging_loss = loss.detach()
-                    logging_loss = maybe_all_reduce(logging_loss).item()
-                    if self.dist.primary:
-                        losses[f"translator_{i}"].append(logging_loss)
+                # Scale for grad accumulation and backprop NOW (frees buffers earlier)
+                (loss_i / grad_acc_steps).backward()
 
-                    scaled_loss = loss / grad_acc_steps
+                # Lightweight local running sum (every rank keeps one)
+                if running_loss_sum is None:
+                    running_loss_sum = loss_i.detach().float()
+                else:
+                    running_loss_sum = running_loss_sum + loss_i.detach().float()
+                running_loss_count += 1
 
-                scaled_loss.backward()
-
+            # --- step on boundaries ---
             step, rem = divmod(batch_idx, grad_acc_steps)
             if rem == grad_acc_steps - 1:
                 th.nn.utils.clip_grad_norm_(state.lens.parameters(), 1.0)
                 state.opt.step()
-                state.opt.zero_grad(set_to_none=False)
+                state.opt.zero_grad(set_to_none=True)
                 state.scheduler.step()
 
-                # Unwrap the lens from DDP if needed
-                lens = getattr(state.lens, "module", state.lens)
-                self._log(state.opt, step, losses, lens, state.nats_to_bpb)
-                losses.clear()
+                # Compute per-rank mean, then participate in the all-reduce on ALL ranks
+                if running_loss_sum is None:
+                    local_mean = th.tensor(0.0, device=self.dist.device)
+                else:
+                    local_mean = running_loss_sum / max(1, running_loss_count)
+
+                global_mean = maybe_all_reduce(local_mean)  # ALL ranks call this
+                mean_loss = float(global_mean.item())
+
+                # Build tqdm postfix (primary only)
+                if self.dist.primary:
+                    postfix = {"avg_loss": f"{mean_loss * state.nats_to_bpb:.4f}"}
+
+                    if th.cuda.is_available():
+                        # peak since process start; no reset needed
+                        current_peak_bytes = th.cuda.max_memory_allocated()
+                        if current_peak_bytes > last_reported_peak_bytes:
+                            last_reported_peak_bytes = current_peak_bytes
+                            peak_mem_gb = current_peak_bytes / (1024 ** 3)
+                            postfix["peak_mem_GB"] = f"{peak_mem_gb:.2f}"
+
+                    t.set_postfix(postfix)
+
+                    lens = getattr(state.lens, "module", state.lens)
+                    self._log(state.opt, step, {"avg": [mean_loss]}, lens, state.nats_to_bpb)
+
+                # reset running stats window
+                running_loss_sum = None
+                running_loss_count = 0
+
                 state.step = step + 1
-                if (
-                    self.checkpoint_freq
-                    and step % self.checkpoint_freq == self.checkpoint_freq - 1
-                ):
+                if self.checkpoint_freq and step % self.checkpoint_freq == self.checkpoint_freq - 1:
                     self.snapshot(state)
 
         if self.dist.primary:
             logger.info(f"Saving lens to {self.output}")
-
-            # Unwrap the lens from DDP if needed
             lens = getattr(state.lens, "module", state.lens)
             lens.save(self.output)

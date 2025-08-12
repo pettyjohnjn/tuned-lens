@@ -1,2 +1,2 @@
 """The tuned lens package."""
-from .nn import TunedLens
+from .nn import TunedLens, LoraLens
