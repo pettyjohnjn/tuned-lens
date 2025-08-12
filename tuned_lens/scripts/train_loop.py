@@ -1,3 +1,4 @@
+# train_loop.py
 """Training loop for training a TunedLens model against a transformer on a dataset."""
 import dataclasses
 import enum
@@ -32,9 +33,11 @@ class LossChoice(enum.Enum):
     CE = "ce"
     KL = "kl"
 
+
 class LensVariant(enum.Enum):
     TUNED = "tuned"
     LORA = "lora"
+
 
 @dataclass
 class State:
@@ -130,6 +133,13 @@ class Train:
 
     lens_variant: LensVariant = field(default=LensVariant.TUNED, alias=["--lens-variant"])
     lora_rank: int = field(default=16, alias=["--lora-rank"])
+
+    # ---- memory/efficiency knobs ----
+    topk: int = field(default=256, alias=["--topk"])
+    """Number of teacher tokens to keep per position for KL subset."""
+
+    time_chunk: int = field(default=256, alias=["--time-chunk"])
+    """Sequence chunk length to process at once (reduces peak from (B,T,V) to (B,tc,V))."""
 
     def __post_init__(self):
         """Set defaults for some fields."""
@@ -261,7 +271,7 @@ class Train:
         if self.dist.primary:
             assert self.checkpoint_dir is not None
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            state.save(self.checkpoint_dir / f"snapshot_{state.step}.pth")
+            state.save(self.checkpoint_dir / f"snapshot_{self.step}.pth")
 
     def load_recent_snapshot(self, state: State) -> None:
         """Load the most recent snapshot of the training process from disk."""
@@ -334,10 +344,7 @@ class Train:
         self.dist.init()
         model = tokenizer = data = lens = nats_to_bpb = None
 
-        # Annoyingly, FSDP is incompatible with the `device_map` parameter on
-        # `from_pretrained`, because it adds forward hooks to the submodules that move
-        # things around to different devices. But `bitsandbytes` requires `device_map`
-        # to work at all. So we use `device_map` iff we're using FSDP.
+        # FSDP vs device_map note: see original comments
         load_device = self.dist.device if not self.dist.fsdp else None
 
         if self.dist.primary:
@@ -346,10 +353,9 @@ class Train:
             data, nats_to_bpb = self.data.load(tokenizer)
             lens = self.get_lens(model)
 
-        self.dist.barrier()  # Wait for primary to finish filling the cache
+        self.dist.barrier()
 
         if not self.dist.primary:
-            # Let the non-primary processes load from the cache
             logger.debug("Non-primary rank loading from cache...")
             model, tokenizer = self.model.load(load_device, must_use_cache=True)
             data, nats_to_bpb = self.data.load(tokenizer)
@@ -391,9 +397,55 @@ class Train:
             tokens_per_sample, len(data)
         )
 
-        self.dist.barrier()  # Wait for all processes to finish setup
+        self.dist.barrier()
         logger.info("All processes have completed setup.")
         return state, model, grad_acc_steps
+
+    # -----------------------
+    # Helper: compute teacher top-K per time-chunk, kept on GPU
+    # -----------------------
+    @th.no_grad()
+    def _teacher_topk_gpu(
+        self,
+        final_logits: th.Tensor,
+        shift: int,
+        k: int,
+        time_chunk: int,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """
+        Args:
+            final_logits: (B, T, V) on device
+            shift: token shift to align labels
+            k: top-k to keep
+            time_chunk: T chunk size to process at a time
+
+        Returns:
+            topk_idx:  (B, T, K) int64 on device
+            topk_logq: (B, T, K) bf16  on device, renormalized over K
+        """
+        device = final_logits.device
+        B, T, _ = final_logits.shape
+        idx_buf = []
+        logq_buf = []
+
+        for t0 in range(0, T, time_chunk):
+            t1 = min(t0 + time_chunk, T)
+            # Work in fp32 for stability, then cast to bf16 for storage
+            logits_slice = final_logits[:, t0:t1].float()  # (B, tc, V)
+            vals, idx = logits_slice.topk(k=k, dim=-1)     # (B, tc, K)
+            vals = shift_labels(vals, shift).contiguous()
+            idx = shift_labels(idx, shift).contiguous()
+
+            logq = vals - vals.logsumexp(-1, keepdim=True)  # (B, tc, K)
+
+            idx_buf.append(idx.to(device, dtype=th.long, non_blocking=True))
+            logq_buf.append(logq.to(device=device, dtype=th.bfloat16, non_blocking=True))
+
+            del logits_slice, vals, idx, logq
+
+        topk_idx = th.cat(idx_buf, dim=1)   # (B, T, K)
+        topk_logq = th.cat(logq_buf, dim=1) # (B, T, K)
+        return topk_idx, topk_logq
 
     def execute(self):
         """Trains a TunedLens model against a transformer on a dataset."""
@@ -432,57 +484,85 @@ class Train:
         last_reported_peak_bytes = 0
 
         for batch_idx, batch in zip(t, state.dataloader):
-            # --- model forward (no autograd at all) ---
+            # -------------------------
+            # Forward model once (no autograd), get final logits + hidden states
+            # -------------------------
             with th.no_grad():
                 batch = self.dist.send_to_device(batch)
                 output = model(**batch, output_hidden_states=True)
 
-            # Extract and free large containers early
-            final_logits = output.logits
-            hidden_states = output.hidden_states[:-1]  # list[Tensor]
-            del output  # free the container ASAP
+            final_logits = output.logits  # (B, T, V) on device
+            hidden_states = output.hidden_states[:-1]  # list[Tensor] of (B,T,d) on device
+            del output  # free container
 
-            # Prepare labels once
+            # -------------------------
+            # Build labels or teacher subset (kept on GPU)
+            # -------------------------
             if self.loss == LossChoice.CE:
                 shift = 1 if self.token_shift is None else self.token_shift
-                labels = shift_labels(batch["input_ids"], shift)
+                labels = shift_labels(batch["input_ids"], shift).to(self.dist.device)
                 del final_logits
             else:
-                # Teacher log-probs once (float32 for stability), then free logits
-                teacher_logprobs = final_logits.float().log_softmax(dim=-1)
-                del final_logits
-                teacher_logprobs = teacher_logprobs.to(th.bfloat16)
                 shift = 0 if self.token_shift is None else self.token_shift
-                labels = shift_labels(teacher_logprobs, shift)
-                # Optional memory saver:
-                # labels = labels.to(th.bfloat16)
+                topk_idx, topk_logq = self._teacher_topk_gpu(
+                    final_logits=final_logits,
+                    shift=shift,
+                    k=self.topk,
+                    time_chunk=self.time_chunk,
+                )
+                del final_logits  # free logits ASAP
 
-            # --- lens forward + loss ---
-            # Backprop PER LAYER to lower peak memory
+            # -------------------------
+            # Lens forward + loss (layer-wise, time-chunked), all on GPU
+            # -------------------------
             for i, h in enumerate(hidden_states):
-                with th.autocast(self.dist.device.type, dtype=th.bfloat16):
-                    preds = shift_preds(state.lens(h, idx=i), shift)
+                B, T, _ = h.shape
+                for t0 in range(0, T, self.time_chunk):
+                    t1 = min(t0 + self.time_chunk, T)
+                    h_slice = h[:, t0:t1]  # (B, tc, d) on device
 
-                    if self.loss == LossChoice.CE:
-                        loss_i = th.nn.functional.cross_entropy(
-                            preds.flatten(0, -2), labels.flatten()
-                        )
+                    with th.autocast(self.dist.device.type, dtype=th.bfloat16):
+                        preds = state.lens(h_slice, idx=i)  # (B, tc, V)
+
+                        if self.loss == LossChoice.CE:
+                            preds_s = shift_preds(preds, shift)
+                            loss_i = th.nn.functional.cross_entropy(
+                                preds_s.flatten(0, -2),
+                                labels[:, t0:t1].flatten(),
+                            )
+                        else:
+                            preds_s = shift_preds(preds, shift)  # (B, tc, V)
+
+                            # Gather only the K needed columns (all on device)
+                            idx_slice = topk_idx[:, t0:t1]   # (B, tc, K)
+                            logq_slice = topk_logq[:, t0:t1] # (B, tc, K)
+                            logits_k = preds_s.gather(-1, idx_slice)  # (B, tc, K)
+                            logp_k = logits_k.log_softmax(-1)
+
+                            # KL(Q||P) over subset K
+                            loss_i = th.sum(
+                                logq_slice.exp() * (logq_slice - logp_k), dim=-1
+                            ).mean()
+
+                    (loss_i / grad_acc_steps).backward()
+
+                    # free big temporaries ASAP
+                    del preds
+                    if self.loss == LossChoice.KL:
+                        del logits_k, logp_k
+
+                    if running_loss_sum is None:
+                        running_loss_sum = loss_i.detach().float()
                     else:
-                        # KL(P||Q) where labels are log P (teacher)
-                        logp_pred = preds.log_softmax(-1)
-                        loss_i = th.sum(labels.exp() * (labels - logp_pred), dim=-1).mean()
+                        running_loss_sum = running_loss_sum + loss_i.detach().float()
+                    running_loss_count += 1
 
-                # Scale for grad accumulation and backprop NOW (frees buffers earlier)
-                (loss_i / grad_acc_steps).backward()
+            # free hidden states list ASAP
+            del hidden_states
 
-                # Lightweight local running sum (every rank keeps one)
-                if running_loss_sum is None:
-                    running_loss_sum = loss_i.detach().float()
-                else:
-                    running_loss_sum = running_loss_sum + loss_i.detach().float()
-                running_loss_count += 1
-
-            # --- step on boundaries ---
+            # -------------------------
+            # Step on boundaries
+            # -------------------------
             step, rem = divmod(batch_idx, grad_acc_steps)
             if rem == grad_acc_steps - 1:
                 th.nn.utils.clip_grad_norm_(state.lens.parameters(), 1.0)
@@ -499,24 +579,19 @@ class Train:
                 global_mean = maybe_all_reduce(local_mean)  # ALL ranks call this
                 mean_loss = float(global_mean.item())
 
-                # Build tqdm postfix (primary only)
                 if self.dist.primary:
                     postfix = {"avg_loss": f"{mean_loss * state.nats_to_bpb:.4f}"}
-
                     if th.cuda.is_available():
-                        # peak since process start; no reset needed
                         current_peak_bytes = th.cuda.max_memory_allocated()
                         if current_peak_bytes > last_reported_peak_bytes:
                             last_reported_peak_bytes = current_peak_bytes
                             peak_mem_gb = current_peak_bytes / (1024 ** 3)
                             postfix["peak_mem_GB"] = f"{peak_mem_gb:.2f}"
-
                     t.set_postfix(postfix)
 
                     lens = getattr(state.lens, "module", state.lens)
                     self._log(state.opt, step, {"avg": [mean_loss]}, lens, state.nats_to_bpb)
 
-                # reset running stats window
                 running_loss_sum = None
                 running_loss_count = 0
 
