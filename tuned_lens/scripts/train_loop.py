@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
-import torch as th
+import torch
 from simple_parsing import field
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -51,10 +51,10 @@ class State:
     nats_to_bpb: float
     step: int = 0
 
-    def load(self, snapshot_file: Path, device: th.device) -> None:
+    def load(self, snapshot_file: Path, device: torch.device) -> None:
         """Load a snapshot file."""
         logger.info(f"Loading snapshot from {snapshot_file}...")
-        snapshot = th.load(snapshot_file, map_location=device)
+        snapshot = torch.load(snapshot_file, map_location=device)
         self.step = snapshot["step"]
         self.wandb_id = snapshot["wandb_id"]
         self.lens.load_state_dict(snapshot["lens"])
@@ -68,7 +68,7 @@ class State:
         if isinstance(self.opt, ZeroRedundancyOptimizer):
             self.opt.consolidate_state_dict()
 
-        th.save(
+        torch.save(
             {
                 "lens": self.lens.state_dict(),
                 "optim": self.opt.state_dict(),
@@ -176,7 +176,7 @@ class Train:
             logger.info("Freezing non-bias parameters (bias-only training).")
             for probe in lens:
                 # TunedLens: probe is nn.Linear(d,d)
-                if isinstance(probe, th.nn.Linear):
+                if isinstance(probe, torch.nn.Linear):
                     probe.weight.requires_grad_(False)
                     if probe.bias is not None:
                         probe.bias.requires_grad_(True)
@@ -218,7 +218,7 @@ class Train:
 
     def _log(
         self,
-        opt: th.optim.Optimizer,
+        opt: torch.optim.Optimizer,
         step: int,
         losses: dict[str, list[float]],
         tuned_lens: TunedLens,
@@ -232,7 +232,7 @@ class Train:
 
         log_dict = {}
         log_dict.update(
-            {f"loss/{k}": th.tensor(v).mean() * nats_to_bpb for k, v in losses.items()}
+            {f"loss/{k}": torch.tensor(v).mean() * nats_to_bpb for k, v in losses.items()}
         )
 
         # Log statistics about optimizer & probes
@@ -242,17 +242,17 @@ class Train:
 
             corr = 1 - self.opt.momentum**step
             if self.opt.optimizer == "sgd" and not self.opt.zero:
-                log_dict["grad_norm/" + name] = th.cat(
+                log_dict["grad_norm/" + name] = torch.cat(
                     [(1 - self.opt.momentum) * s["momentum_buffer"].flatten() / corr
                      for s in states if "momentum_buffer" in s]
                 ).norm()
             elif self.opt.optimizer == "adam" and not self.opt.zero:
-                log_dict["grad_norm/" + name] = th.cat(
+                log_dict["grad_norm/" + name] = torch.cat(
                     [s["exp_avg"].flatten() / corr for s in states if "exp_avg" in s]
                 ).norm()
 
             # Parameter norms by probe type
-            if isinstance(probe, th.nn.Linear):
+            if isinstance(probe, torch.nn.Linear):
                 log_dict["bias_norm/" + name] = probe.bias.data.norm()
                 log_dict["weight_norm/" + name] = probe.weight.data.norm()
             else:
@@ -404,14 +404,14 @@ class Train:
     # -----------------------
     # Helper: compute teacher top-K per time-chunk, kept on GPU
     # -----------------------
-    @th.no_grad()
+    @torch.no_grad()
     def _teacher_topk_gpu(
         self,
-        final_logits: th.Tensor,
+        final_logits: torch.Tensor,
         shift: int,
         k: int,
         time_chunk: int,
-    ) -> tuple[th.Tensor, th.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             final_logits: (B, T, V) on device
@@ -438,71 +438,60 @@ class Train:
 
             logq = vals - vals.logsumexp(-1, keepdim=True)  # (B, tc, K)
 
-            idx_buf.append(idx.to(device, dtype=th.long, non_blocking=True))
-            logq_buf.append(logq.to(device=device, dtype=th.bfloat16, non_blocking=True))
+            idx_buf.append(idx.to(device, dtype=torch.long, non_blocking=True))
+            logq_buf.append(logq.to(device=device, dtype=torch.bfloat16, non_blocking=True))
 
             del logits_slice, vals, idx, logq
 
-        topk_idx = th.cat(idx_buf, dim=1)   # (B, T, K)
-        topk_logq = th.cat(logq_buf, dim=1) # (B, T, K)
+        topk_idx = torch.cat(idx_buf, dim=1)   # (B, T, K)
+        topk_logq = torch.cat(logq_buf, dim=1) # (B, T, K)
         return topk_idx, topk_logq
 
     def execute(self):
         """Trains a TunedLens model against a transformer on a dataset."""
-        # Load model, tokenizer, data, and lens
+        # --------------- set-up (unchanged) --------------------------------
         state, model, grad_acc_steps = self.setup()
 
-        # Enable TF32 for matmuls (safe with bf16)
-        if th.cuda.is_available():
-            th.backends.cuda.matmul.allow_tf32 = True
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
             try:
-                th.set_float32_matmul_precision("high")
+                torch.set_float32_matmul_precision("high")
             except AttributeError:
-                pass  # older PyTorch
+                pass
 
-        init_batches = state.step * grad_acc_steps
+        init_batches  = state.step * grad_acc_steps
         total_batches = self.num_steps * grad_acc_steps
 
-        # Wait for all processes to finish setup
         self.dist.barrier()
         logger.info("All processes have completed setup. Starting training.")
 
-        # Main training loop
-        t = trange(
-            init_batches,
-            total_batches,
-            desc="Training",
-            initial=init_batches,
-            total=total_batches,
-        )
+        t = trange(init_batches,
+                total_batches,
+                desc="Training",
+                initial=init_batches,
+                total=total_batches)
 
-        # Per-rank lightweight running stats for this optimizer window
-        running_loss_sum = None  # tensor on device
+        running_loss_sum   = None
         running_loss_count = 0
-
-        # Track peak memory without resetting (primary only)
         last_reported_peak_bytes = 0
 
+        # --------------- main loop ----------------------------------------
         for batch_idx, batch in zip(t, state.dataloader):
-            # -------------------------
-            # Forward model once (no autograd), get final logits + hidden states
-            # -------------------------
-            with th.no_grad():
+            # Forward through the base model (no grads)
+            with torch.no_grad():
                 batch = self.dist.send_to_device(batch)
                 output = model(**batch, output_hidden_states=True)
 
-            final_logits = output.logits  # (B, T, V) on device
-            hidden_states = output.hidden_states[:-1]  # list[Tensor] of (B,T,d) on device
-            del output  # free container
+            final_logits  = output.logits            # (B,T,V)
+            hidden_states = output.hidden_states[:-1]
+            del output
 
-            # -------------------------
-            # Build labels or teacher subset (kept on GPU)
-            # -------------------------
+            # ----- teacher targets ----------------------------------------
             if self.loss == LossChoice.CE:
-                shift = 1 if self.token_shift is None else self.token_shift
+                shift  = 1 if self.token_shift is None else self.token_shift
                 labels = shift_labels(batch["input_ids"], shift).to(self.dist.device)
                 del final_logits
-            else:
+            else:                                    # KL branch
                 shift = 0 if self.token_shift is None else self.token_shift
                 topk_idx, topk_logq = self._teacher_topk_gpu(
                     final_logits=final_logits,
@@ -510,96 +499,90 @@ class Train:
                     k=self.topk,
                     time_chunk=self.time_chunk,
                 )
-                del final_logits  # free logits ASAP
+                del final_logits
 
-            # -------------------------
-            # Lens forward + loss (layer-wise, time-chunked), all on GPU
-            # -------------------------
+            # ----- iterate over layers & time chunks ----------------------
             for i, h in enumerate(hidden_states):
                 B, T, _ = h.shape
                 for t0 in range(0, T, self.time_chunk):
-                    t1 = min(t0 + self.time_chunk, T)
-                    h_slice = h[:, t0:t1]  # (B, tc, d) on device
+                    t1       = min(t0 + self.time_chunk, T)
+                    h_slice  = h[:, t0:t1]                       # (B,tc,d)
 
-                    with th.autocast(self.dist.device.type, dtype=th.bfloat16):
-                        preds = state.lens(h_slice, idx=i)  # (B, tc, V)
-
+                    with torch.autocast(self.dist.device.type, dtype=torch.bfloat16):
+                        # ========== CE loss path (full vocab) ============
                         if self.loss == LossChoice.CE:
-                            preds_s = shift_preds(preds, shift)
-                            loss_i = th.nn.functional.cross_entropy(
+                            logits_full = state.lens(h_slice, idx=i)        # (B,tc,V)
+                            preds_s     = shift_preds(logits_full, shift)
+                            loss_i      = torch.nn.functional.cross_entropy(
                                 preds_s.flatten(0, -2),
                                 labels[:, t0:t1].flatten(),
                             )
+
+                        # ========== KL loss path (top-k only) ============
                         else:
-                            preds_s = shift_preds(preds, shift)  # (B, tc, V)
+                            idx_slice  = topk_idx[:, t0:t1]                  # (B,tc,k)
+                            logq_slice = topk_logq[:, t0:t1]                # (B,tc,k)
 
-                            # Gather only the K needed columns (all on device)
-                            idx_slice = topk_idx[:, t0:t1]   # (B, tc, K)
-                            logq_slice = topk_logq[:, t0:t1] # (B, tc, K)
-                            logits_k = preds_s.gather(-1, idx_slice)  # (B, tc, K)
-                            logp_k = logits_k.log_softmax(-1)
+                            # ---- NEW: request only the needed vocab rows
+                            logits_k = state.lens(
+                                h_slice,
+                                idx=i,
+                                idx_subset=idx_slice,
+                            )                                               # (B,tc,k)
 
-                            # KL(Q||P) over subset K
-                            loss_i = th.sum(
-                                logq_slice.exp() * (logq_slice - logp_k), dim=-1
-                            ).mean()
+                            preds_s = shift_preds(logits_k, shift)          # (B,tc,k)
+                            logp_k  = preds_s.log_softmax(-1)
 
+                            loss_i  = (logq_slice.exp() *
+                                    (logq_slice - logp_k)).sum(-1).mean()
+
+                    # back-prop (grad-acc)
                     (loss_i / grad_acc_steps).backward()
-
-                    # free big temporaries ASAP
-                    del preds
-                    if self.loss == LossChoice.KL:
-                        del logits_k, logp_k
 
                     if running_loss_sum is None:
                         running_loss_sum = loss_i.detach().float()
                     else:
-                        running_loss_sum = running_loss_sum + loss_i.detach().float()
+                        running_loss_sum += loss_i.detach().float()
                     running_loss_count += 1
 
-            # free hidden states list ASAP
-            del hidden_states
+            del hidden_states  # free memory
 
-            # -------------------------
-            # Step on boundaries
-            # -------------------------
+            # ----- step optimiser on grad-acc boundary -------------------
             step, rem = divmod(batch_idx, grad_acc_steps)
             if rem == grad_acc_steps - 1:
-                th.nn.utils.clip_grad_norm_(state.lens.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(state.lens.parameters(), 1.0)
                 state.opt.step()
                 state.opt.zero_grad(set_to_none=True)
                 state.scheduler.step()
 
-                # Compute per-rank mean, then participate in the all-reduce on ALL ranks
-                if running_loss_sum is None:
-                    local_mean = th.tensor(0.0, device=self.dist.device)
-                else:
-                    local_mean = running_loss_sum / max(1, running_loss_count)
-
-                global_mean = maybe_all_reduce(local_mean)  # ALL ranks call this
-                mean_loss = float(global_mean.item())
+                local_mean  = (running_loss_sum /
+                            max(1, running_loss_count)
+                            if running_loss_sum is not None
+                            else torch.tensor(0.0, device=self.dist.device))
+                global_mean = maybe_all_reduce(local_mean)
+                mean_loss   = float(global_mean.item())
 
                 if self.dist.primary:
                     postfix = {"avg_loss": f"{mean_loss * state.nats_to_bpb:.4f}"}
-                    if th.cuda.is_available():
-                        current_peak_bytes = th.cuda.max_memory_allocated()
-                        if current_peak_bytes > last_reported_peak_bytes:
-                            last_reported_peak_bytes = current_peak_bytes
-                            peak_mem_gb = current_peak_bytes / (1024 ** 3)
-                            postfix["peak_mem_GB"] = f"{peak_mem_gb:.2f}"
+                    if torch.cuda.is_available():
+                        peak_bytes = torch.cuda.max_memory_allocated()
+                        if peak_bytes > last_reported_peak_bytes:
+                            last_reported_peak_bytes = peak_bytes
+                            postfix["peak_mem_GB"] = f"{peak_bytes / 1_073_741_824:.2f}"
                     t.set_postfix(postfix)
+                    self._log(state.opt, step, {"avg": [mean_loss]},
+                            getattr(state.lens, "module", state.lens),
+                            state.nats_to_bpb)
 
-                    lens = getattr(state.lens, "module", state.lens)
-                    self._log(state.opt, step, {"avg": [mean_loss]}, lens, state.nats_to_bpb)
-
-                running_loss_sum = None
+                running_loss_sum   = None
                 running_loss_count = 0
+                state.step         = step + 1
 
-                state.step = step + 1
-                if self.checkpoint_freq and step % self.checkpoint_freq == self.checkpoint_freq - 1:
+                if (self.checkpoint_freq and
+                    step % self.checkpoint_freq == self.checkpoint_freq - 1):
                     self.snapshot(state)
 
+        # --------------- save final lens (unchanged) ----------------------
         if self.dist.primary:
             logger.info(f"Saving lens to {self.output}")
-            lens = getattr(state.lens, "module", state.lens)
-            lens.save(self.output)
+            getattr(state.lens, "module", state.lens).save(self.output)

@@ -33,6 +33,6 @@ torchrun \
     --output my_lenses/gpt2-Tuned-Lens \
     # --lens-variant LORA \
     # --lora-rank 4 \
-    # --precision bfloat16 \
-    # --topk 128 \
-    # --time_chunk 2048 \
+    --precision bfloat16 \
+    --topk 512 \
+    --time_chunk 512 \

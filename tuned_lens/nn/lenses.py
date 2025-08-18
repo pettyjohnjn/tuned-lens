@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Generator, Optional, Union
 
-import torch as th
+import torch
 from transformers import PreTrainedModel
 
 from tuned_lens import load_artifacts
@@ -17,7 +17,7 @@ from tuned_lens.nn.unembed import Unembed
 logger = logging.getLogger(__name__)
 
 
-class Lens(abc.ABC, th.nn.Module):
+class Lens(abc.ABC, torch.nn.Module):
     """Abstract base class for all Lens."""
 
     unembed: Unembed
@@ -33,7 +33,7 @@ class Lens(abc.ABC, th.nn.Module):
         self.unembed = unembed
 
     @abc.abstractmethod
-    def transform_hidden(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def transform_hidden(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Convert a hidden state to the final hidden just before the unembedding.
 
         Args:
@@ -43,7 +43,9 @@ class Lens(abc.ABC, th.nn.Module):
         ...
 
     @abc.abstractmethod
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def forward(
+        self, h: torch.Tensor, idx: int, *, idx_subset: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Decode hidden states into logits."""
         ...
 
@@ -77,12 +79,12 @@ class LogitLens(Lens):
         unembed = Unembed(model)
         return cls(unembed)
 
-    def transform_hidden(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def transform_hidden(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """For the LogitLens, this is the identity function."""
         del idx
         return h
 
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def forward(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Decode a hidden state into logits.
 
         Args:
@@ -134,7 +136,7 @@ class TunedLens(Lens):
 
     config: TunedLensConfig
     unembed: Unembed
-    layer_translators: th.nn.ModuleList
+    layer_translators: torch.nn.ModuleList
 
     def __init__(
         self,
@@ -155,24 +157,24 @@ class TunedLens(Lens):
 
         # The unembedding might be int8 if we're using bitsandbytes
         w = unembed.unembedding.weight
-        dtype = w.dtype if th.is_floating_point(w) else th.float16
+        dtype = w.dtype if torch.is_floating_point(w) else torch.float16
 
-        translator = th.nn.Linear(
+        translator = torch.nn.Linear(
             config.d_model, config.d_model, bias=config.bias, dtype=dtype
         )
         translator.weight.data.zero_()
         translator.bias.data.zero_()
 
         # Don't include the final layer since it does not need a translator
-        self.layer_translators = th.nn.ModuleList(
+        self.layer_translators = torch.nn.ModuleList(
             [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
         )
 
-    def __getitem__(self, item: int) -> th.nn.Module:
+    def __getitem__(self, item: int) -> torch.nn.Module:
         """Get the probe module at the given index."""
         return self.layer_translators[item]
 
-    def __iter__(self) -> Generator[th.nn.Module, None, None]:
+    def __iter__(self) -> Generator[torch.nn.Module, None, None]:
         """Get iterator over the translators within the lens."""
         yield from self.layer_translators
 
@@ -219,7 +221,7 @@ class TunedLens(Lens):
                 model's name_or_path.
             **kwargs: Additional arguments to pass to
                 :func:`tuned_lens.load_artifacts.load_lens_artifacts` and
-                `th.load <https://pytorch.org/docs/stable/generated/torch.load.html>`_.
+                `torch.load <https://pytorch.org/docs/stable/generated/torch.load.html>`_.
 
         Returns:
             A TunedLens instance whose unembedding is derived from the given model
@@ -246,7 +248,7 @@ class TunedLens(Lens):
             lens_resource_id: The resource id of the lens to load.
             **kwargs: Additional arguments to pass to
                 :func:`tuned_lens.load_artifacts.load_lens_artifacts` and
-                `th.load <https://pytorch.org/docs/stable/generated/torch.load.html>`_.
+                `torch.load <https://pytorch.org/docs/stable/generated/torch.load.html>`_.
 
         Returns:
             A TunedLens instance.
@@ -276,7 +278,7 @@ class TunedLens(Lens):
             **{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}
         }
         # Load parameters
-        state = th.load(ckpt_path, **th_load_kwargs)
+        state = torch.load(ckpt_path, **th_load_kwargs)
 
         lens.layer_translators.load_state_dict(state)
 
@@ -299,36 +301,37 @@ class TunedLens(Lens):
         path.mkdir(exist_ok=True, parents=True)
         state_dict = self.layer_translators.state_dict()
 
-        th.save(state_dict, path / ckpt)
+        torch.save(state_dict, path / ckpt)
         with open(path / config, "w") as f:
             json.dump(self.config.to_dict(), f)
 
-    def transform_hidden(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def transform_hidden(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Transform hidden state from layer `idx`."""
         # Note that we add the translator output residually, in contrast to the formula
         # in the paper. By parametrizing it this way we ensure that weight decay
         # regularizes the transform toward the identity, not the zero transformation.
         return h + self[idx](h)
 
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
-        """Transform and then decode the hidden states into logits."""
+    def forward(
+        self, h: torch.Tensor, idx: int, *, idx_subset: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         h = self.transform_hidden(h, idx)
-        return self.unembed.forward(h)
+        return self.unembed.forward(h, idx_subset=idx_subset)
 
     def __len__(self) -> int:
         """Return the number of layer translators in the lens."""
         return len(self.layer_translators)
 
-    @th.inference_mode()
+    @torch.inference_mode()
     def generate(
         self,
         model: PreTrainedModel,
         layer: int,
-        input_ids: th.Tensor,
+        input_ids: torch.Tensor,
         do_sample: bool = True,
         temp: float = 1.0,
         max_new_tokens: int = 100,
-    ) -> th.Tensor:
+    ) -> torch.Tensor:
         """Generate from the tuned lens at the given layer.
 
         Args:
@@ -351,7 +354,7 @@ class TunedLens(Lens):
         batch, prompt_len = tokens.shape
         del prompt_len
         past_key_values = None
-        done = th.zeros(batch, dtype=th.bool)
+        done = torch.zeros(batch, dtype=torch.bool)
 
         for _ in range(max_new_tokens):
             output = model(
@@ -367,7 +370,7 @@ class TunedLens(Lens):
             if do_sample:
                 new_logits = new_logits / temp
                 probs = new_logits.softmax(dim=-1)
-                new_tokens = th.multinomial(probs, num_samples=1)
+                new_tokens = torch.multinomial(probs, num_samples=1)
             else:
                 new_tokens = new_logits.argmax(dim=-1, keepdim=True)
 
@@ -375,7 +378,7 @@ class TunedLens(Lens):
             # other tokens.
             done = done | (new_tokens == eos_token)
             new_tokens = new_tokens.masked_fill(done, eos_token)
-            tokens = th.cat([tokens, new_tokens], dim=-1)
+            tokens = torch.cat([tokens, new_tokens], dim=-1)
             # Halt generation if all sequences have generated an EOS token.
             if done.all():
                 break
@@ -416,29 +419,29 @@ class LoraLensConfig:
         return cls(**config_dict)
 
 
-class _LowRankLinear(th.nn.Module):
+class _LowRankLinear(torch.nn.Module):
     """Low-rank affine: up(down(x)) + bias, where down: d->r, up: r->d."""
 
-    def __init__(self, d_model: int, rank: int, bias: bool = True, dtype: th.dtype = th.float32):
+    def __init__(self, d_model: int, rank: int, bias: bool = True, dtype: torch.dtype = torch.float32):
         super().__init__()
         if rank <= 0 or rank > d_model:
             raise ValueError(f"rank must be in [1, d_model], got rank={rank}, d_model={d_model}")
 
         # down: d_model -> rank, up: rank -> d_model
-        self.down = th.nn.Linear(d_model, rank, bias=False, dtype=dtype)
-        self.up = th.nn.Linear(rank, d_model, bias=False, dtype=dtype)
+        self.down = torch.nn.Linear(d_model, rank, bias=False, dtype=dtype)
+        self.up = torch.nn.Linear(rank, d_model, bias=False, dtype=dtype)
 
         # Initialize to zero so overall map starts as identity when used residually.
-        th.nn.init.zeros_(self.down.weight)
-        th.nn.init.zeros_(self.up.weight)
+        torch.nn.init.xavier_uniform_(self.down.weight)
+        torch.nn.init.zeros_(self.up.weight)
 
         self.use_bias = bias
         if bias:
-            self.bias = th.nn.Parameter(th.zeros(d_model, dtype=dtype))
+            self.bias = torch.nn.Parameter(torch.zeros(d_model, dtype=dtype))
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x: th.Tensor) -> th.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.up(self.down(x))
         if self.use_bias:
             y = y + self.bias
@@ -450,7 +453,7 @@ class LoraLens(Lens):
 
     config: LoraLensConfig
     unembed: Unembed
-    layer_translators: th.nn.ModuleList
+    layer_translators: torch.nn.ModuleList
 
     def __init__(self, unembed: Unembed, config: LoraLensConfig):
         """Create a LoraLens.
@@ -467,7 +470,7 @@ class LoraLens(Lens):
 
         # Match dtype of unembedding (may be int8 quantized; fall back to fp16)
         w = unembed.unembedding.weight
-        dtype = w.dtype if th.is_floating_point(w) else th.float16
+        dtype = w.dtype if torch.is_floating_point(w) else torch.float16
 
         translator = _LowRankLinear(
             d_model=config.d_model,
@@ -477,14 +480,14 @@ class LoraLens(Lens):
         )
 
         # Don't include the final layer since it does not need a translator
-        self.layer_translators = th.nn.ModuleList(
+        self.layer_translators = torch.nn.ModuleList(
             [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
         )
 
-    def __getitem__(self, item: int) -> th.nn.Module:
+    def __getitem__(self, item: int) -> torch.nn.Module:
         return self.layer_translators[item]
 
-    def __iter__(self) -> Generator[th.nn.Module, None, None]:
+    def __iter__(self) -> Generator[torch.nn.Module, None, None]:
         yield from self.layer_translators
 
     @classmethod
@@ -554,7 +557,7 @@ class LoraLens(Lens):
         lens = cls(unembed, config)
 
         th_load_kwargs = {**{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}}
-        state = th.load(ckpt_path, **th_load_kwargs)
+        state = torch.load(ckpt_path, **th_load_kwargs)
 
         lens.layer_translators.load_state_dict(state)
         return lens
@@ -570,32 +573,33 @@ class LoraLens(Lens):
         path.mkdir(exist_ok=True, parents=True)
         state_dict = self.layer_translators.state_dict()
 
-        th.save(state_dict, path / ckpt)
+        torch.save(state_dict, path / ckpt)
         with open(path / config, "w") as f:
             json.dump(self.config.to_dict(), f)
 
-    def transform_hidden(self, h: th.Tensor, idx: int) -> th.Tensor:
+    def transform_hidden(self, h: torch.Tensor, idx: int) -> torch.Tensor:
         """Transform hidden state from layer `idx` using low-rank affine."""
         return h + self[idx](h)
 
-    def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
-        """Transform and then decode the hidden states into logits."""
+    def forward(
+        self, h: torch.Tensor, idx: int, *, idx_subset: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         h = self.transform_hidden(h, idx)
-        return self.unembed.forward(h)
+        return self.unembed.forward(h, idx_subset=idx_subset)
 
     def __len__(self) -> int:
         return len(self.layer_translators)
 
-    @th.inference_mode()
+    @torch.inference_mode()
     def generate(
         self,
         model: PreTrainedModel,
         layer: int,
-        input_ids: th.Tensor,
+        input_ids: torch.Tensor,
         do_sample: bool = True,
         temp: float = 1.0,
         max_new_tokens: int = 100,
-    ) -> th.Tensor:
+    ) -> torch.Tensor:
         """Generate from the LoraLens at the given layer."""
         eos_token = model.generation_config.eos_token_id
 
@@ -605,7 +609,7 @@ class LoraLens(Lens):
         batch, prompt_len = tokens.shape
         del prompt_len
         past_key_values = None
-        done = th.zeros(batch, dtype=th.bool)
+        done = torch.zeros(batch, dtype=torch.bool)
 
         for _ in range(max_new_tokens):
             output = model(
@@ -621,13 +625,13 @@ class LoraLens(Lens):
             if do_sample:
                 new_logits = new_logits / temp
                 probs = new_logits.softmax(dim=-1)
-                new_tokens = th.multinomial(probs, num_samples=1)
+                new_tokens = torch.multinomial(probs, num_samples=1)
             else:
                 new_tokens = new_logits.argmax(dim=-1, keepdim=True)
 
             done = done | (new_tokens == eos_token)
             new_tokens = new_tokens.masked_fill(done, eos_token)
-            tokens = th.cat([tokens, new_tokens], dim=-1)
+            tokens = torch.cat([tokens, new_tokens], dim=-1)
             if done.all():
                 break
 

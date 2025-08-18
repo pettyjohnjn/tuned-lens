@@ -1,7 +1,7 @@
 """Provides a class for mapping transformer hidden states to logits (and vice versa)."""
 import copy
 from dataclasses import dataclass
-from typing import Literal, Optional, cast
+from typing import Literal, Optional, Union, cast
 
 try:
     # Needed for the docs to build without complaining
@@ -11,7 +11,7 @@ try:
 except ImportError:
     _transformer_lens_available = False
 
-import torch as th
+import torch
 from torch.distributions import Distribution
 
 from tuned_lens import model_surgery
@@ -22,18 +22,18 @@ from tuned_lens.utils import tensor_hash
 class InversionOutput:
     """Output of `Unemebd.invert`."""
 
-    preimage: th.Tensor
-    grad_norm: th.Tensor
-    kl: th.Tensor
-    loss: th.Tensor
+    preimage: torch.Tensor
+    grad_norm: torch.Tensor
+    kl: torch.Tensor
+    loss: torch.Tensor
     nfev: int
 
 
-class Unembed(th.nn.Module):
+class Unembed(torch.nn.Module):
     """Module that maps transformer hidden states to logits (and vice versa)."""
 
     final_norm: model_surgery.Norm
-    unembedding: th.nn.Linear
+    unembedding: torch.nn.Linear
 
     def __init__(
         self,
@@ -45,11 +45,16 @@ class Unembed(th.nn.Module):
             model: A HuggingFace model from which to extract the unembedding matrix.
         """
         super().__init__()
-        final_norm = model_surgery.get_final_norm(model)
-        unembedding_matrix = model_surgery.get_unembedding_matrix(model)
+        # final_norm = model_surgery.get_final_norm(model)
+        # unembedding_matrix = model_surgery.get_unembedding_matrix(model)
 
-        self.final_norm = copy.deepcopy(final_norm)
-        self.unembedding = copy.deepcopy(unembedding_matrix)
+        # self.final_norm = copy.deepcopy(final_norm)
+        # self.unembedding = copy.deepcopy(unembedding_matrix)
+
+        self.final_norm = copy.deepcopy(model_surgery.get_final_norm(model))
+        self.unembedding = model_surgery.get_unembedding_matrix(model)
+        for p in self.unembedding.parameters():
+            p.requires_grad_(False)
 
         # In general we don't want to finetune the unembed operation.
         self.requires_grad_(False)
@@ -59,22 +64,55 @@ class Unembed(th.nn.Module):
         parameter = self.unembedding.weight.data.detach().cpu().float().numpy()
         return tensor_hash(parameter)
 
-    def forward(self, h: th.Tensor) -> th.Tensor:
-        """Convert hidden states into logits."""
-        return self.unembedding(self.final_norm(h))
+    # def forward(self, h: torch.Tensor) -> torch.Tensor:
+    #     """Convert hidden states into logits."""
+    #     return self.unembedding(self.final_norm(h))
+
+    def forward(
+        self,
+        h: torch.Tensor,                         # (B,T,d)
+        *,                                       # force keyword
+        idx_subset: Optional[torch.Tensor] = None   # (B,T,k) or None
+    ) -> torch.Tensor:
+        """
+        Convert hidden states to logits.
+        If `idx_subset` is given, compute only those vocab rows and
+        return a (B,T,k) tensor; otherwise return (B,T,V).
+        """
+        h = self.final_norm(h)                   # (B,T,d)
+
+        if idx_subset is None:
+            # Full-vocab path – unchanged
+            return self.unembedding(h)
+
+        # ---- subset path ----
+        B, T, k = idx_subset.shape
+        d       = h.size(-1)
+
+        h_flat   = h.reshape(-1, d)              # (B*T,d)
+        idx_flat = idx_subset.reshape(-1, k)     # (B*T,k)
+
+        uniq_idx, inverse = torch.unique(idx_flat, return_inverse=True)
+        W_sel   = self.unembedding.weight[uniq_idx]   # (u,d)
+        logits_sel = h_flat @ W_sel.T                 # (B*T,u)
+
+        logits_k = torch.gather(
+            logits_sel, 1, inverse.view(-1, k)
+        ).view(B, T, k)
+        return logits_k
 
     def invert(
         self,
-        logits: th.Tensor,
+        logits: torch.Tensor,
         *,
-        h0: Optional[th.Tensor] = None,
+        h0: Optional[torch.Tensor] = None,
         max_iter: int = 1000,
         optimizer: Literal["lbfgs", "sgd"] = "lbfgs",
         prior_weight: float = 0.0,
         prior: Optional[Distribution] = None,
         step_size: float = 1.0,
         tol: float = 1e-3,
-        weight: Optional[th.Tensor] = None,
+        weight: Optional[torch.Tensor] = None,
     ) -> InversionOutput:
         """Project logits onto the image of the unemebed operation.
 
@@ -107,7 +145,7 @@ class Unembed(th.nn.Module):
 
         if h0 is None:
             # Initialize with the Moore-Penrose pseudoinverse
-            h0 = th.zeros((*leading_dims, d_model), device=logits.device)
+            h0 = torch.zeros((*leading_dims, d_model), device=logits.device)
 
         # Sanity check the shape of the initial hidden state. Can silently lead to
         # incorrect results due to broadcasting if we don't check this.
@@ -117,9 +155,9 @@ class Unembed(th.nn.Module):
                 f"{(*leading_dims, d_model)} given logits shape {logits.shape}."
             )
 
-        h_star = th.nn.Parameter(h0)
+        h_star = torch.nn.Parameter(h0)
         if optimizer == "lbfgs":
-            opt = th.optim.LBFGS(
+            opt = torch.optim.LBFGS(
                 [h_star],
                 line_search_fn="strong_wolfe",
                 lr=step_size,
@@ -127,7 +165,7 @@ class Unembed(th.nn.Module):
                 tolerance_change=tol,
             )
         elif optimizer == "sgd":
-            opt = th.optim.SGD([h_star], lr=step_size)
+            opt = torch.optim.SGD([h_star], lr=step_size)
         else:
             raise ValueError(f"Unknown optimizer '{optimizer}'")
 
@@ -136,9 +174,9 @@ class Unembed(th.nn.Module):
         if weight is not None:
             p *= weight
 
-        def compute_loss(h: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        def compute_loss(h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             log_q = self(h).log_softmax(-1)
-            kl = th.sum(p * (log_p - log_q), dim=-1).nanmean()
+            kl = torch.sum(p * (log_p - log_q), dim=-1).nanmean()
             loss = kl.clone()
 
             if prior_weight and prior is not None:
@@ -150,7 +188,7 @@ class Unembed(th.nn.Module):
             return loss, kl
 
         nfev = 0  # Number of function evals, like in scipy.optimize.minimize
-        loss, kl = log_p.new_tensor(th.inf), log_p.new_tensor(th.inf)
+        loss, kl = log_p.new_tensor(torch.inf), log_p.new_tensor(torch.inf)
 
         def closure():
             nonlocal nfev, loss, kl
@@ -165,7 +203,7 @@ class Unembed(th.nn.Module):
             loss.backward()
             return loss
 
-        grad_norm = log_p.new_tensor(th.inf)
+        grad_norm = log_p.new_tensor(torch.inf)
         while nfev < max_iter:
             opt.step(closure)  # type: ignore
 
@@ -176,7 +214,7 @@ class Unembed(th.nn.Module):
             if grad_norm < tol or loss < tol:
                 break
 
-        with th.no_grad():
+        with torch.no_grad():
             output = InversionOutput(
                 preimage=self.final_norm(h_star.data),
                 grad_norm=grad_norm,
