@@ -141,6 +141,9 @@ dmypy.json
 
 # Log Files
 submit_train.pbs.*
+tunedlens_eval_multihook.*
+tunedlens_eval.*
+evaluation/
 
 # dataset / cache outputs
 mycachedir/

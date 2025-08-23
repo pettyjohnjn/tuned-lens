@@ -1,27 +1,19 @@
 # train_loop.py
-"""Training loop for training a TunedLens model against a transformer on a dataset.
+"""Multiple hook-point lens training (final-projection probes) with optional
+per-hook activation dumps to subfolders.
 
-Memory-efficiency highlights
-----------------------------
-1) Streams hidden states: after the model forward (under no_grad), we immediately
-   move *each layer's* hidden state to CPU (optionally pinned, in a reduced dtype).
-   During the loss computation we bring back only small (B, tc, d) time-chunks.
-
-2) Teacher targets: **computed chunk-by-chunk**; we never keep full (B, T, K) on GPU.
-   Each (B, tc, K) teacher chunk is used immediately for all layers, then freed.
-
-3) KL path computes *subset-only* student logits using idx_subset, avoiding (B, tc, V).
-
-4) Keeps the original public API/CLI surface except for a few extra knobs to control
-   offload/streaming behavior (see dataclass fields near the bottom of Train).
+- 'residual_out' uses output_hidden_states (unchanged core logic).
+- 'attn_out' hooks transformer.h.<i>.attn.c_proj outputs.
+- 'mlp_out'  hooks transformer.h.<i>.mlp.c_proj outputs.
 """
+from __future__ import annotations
 import dataclasses
 import enum
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from simple_parsing import field
@@ -37,6 +29,8 @@ import tuned_lens.scripts.ingredients as ing
 from tuned_lens import TunedLens, LoraLens
 from tuned_lens.utils import maybe_all_reduce, shift_labels, shift_preds
 from tuned_lens.nn.lenses import Lens
+
+from tuned_lens.scripts.hook_points import HookManager
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +48,7 @@ class LensVariant(enum.Enum):
 @dataclass
 class State:
     dataloader: DataLoader2
-    lens: Lens
+    lenses: Dict[str, Lens]
     opt: Optimizer
     scheduler: LambdaLR
     wandb_id: Optional[str]
@@ -66,7 +60,9 @@ class State:
         snapshot = torch.load(snapshot_file, map_location=device)
         self.step = snapshot["step"]
         self.wandb_id = snapshot["wandb_id"]
-        self.lens.load_state_dict(snapshot["lens"])
+        lens_sd: Dict[str, dict] = snapshot["lenses"]
+        for k, lens in self.lenses.items():
+            lens.load_state_dict(lens_sd[k])
         self.opt.load_state_dict(snapshot["optim"])
         self.scheduler.load_state_dict(snapshot["scheduler"])
         self.dataloader.load_state_dict(snapshot["dataloader"])
@@ -75,10 +71,9 @@ class State:
         logger.info(f"Saving snapshot to {snapshot_file}...")
         if isinstance(self.opt, ZeroRedundancyOptimizer):
             self.opt.consolidate_state_dict()
-
         torch.save(
             {
-                "lens": self.lens.state_dict(),
+                "lenses": {k: v.state_dict() for k, v in self.lenses.items()},
                 "optim": self.opt.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
                 "dataloader": self.dataloader.state_dict(),
@@ -113,19 +108,33 @@ class Train:
     lens_variant: LensVariant = field(default=LensVariant.TUNED, alias=["--lens-variant"])
     lora_rank: int = field(default=16, alias=["--lora-rank"])
 
-    # ---- memory/efficiency knobs ----
+    # memory/efficiency knobs
     topk: int = field(default=256, alias=["--topk"])
     time_chunk: int = field(default=256, alias=["--time_chunk"])
-
     offload_hidden_to_cpu: bool = field(default=True, alias=["--offload-hidden-to-cpu"])
     offload_dtype: str = field(default="bfloat16", alias=["--offload-dtype"])
     pin_memory_offload: bool = field(default=True, alias=["--pin-memory-offload"])
+
+    # which hook points to train lenses for
+    hook_points: List[str] = field(
+        default_factory=lambda: ["residual_out"],
+        alias=["--hook_points"],
+        help="One or more of: residual_out attn_out mlp_out",
+    )
+
+    # -------- NEW: optional on-disk dumps of activations per hook --------
+    activations_dir: Optional[Path] = field(
+        default=None,
+        alias=["--activations-dir"],
+        help="If set, save per-hook activations each batch under this directory.",
+    )
 
     def __post_init__(self):
         if self.checkpoint_dir is None:
             self.checkpoint_dir = self.output / "checkpoints"
 
-    def get_lens(self, model: PreTrainedModel) -> Lens:
+    # lens factory (same behavior per lens)
+    def _make_single_lens(self, model: PreTrainedModel) -> Lens:
         if self.lens_variant == LensVariant.TUNED:
             lens = (
                 TunedLens.from_model(model)
@@ -140,29 +149,36 @@ class Train:
             )
         else:
             raise ValueError(f"Unknown lens_variant {self.lens_variant}")
-
-        dtypes = {p.dtype for p in lens.parameters()}
-        assert len(dtypes) == 1, f"Expected all parameters to have the same dtype, got {dtypes}"
-        lens_dtype = next(iter(dtypes))
-        lens_size = sum(p.numel() * p.element_size() for p in lens.parameters())
-        num_bytes = lens_size * (self.opt.per_parameter_optim_state_size() + 1)
-        logger.info(f"Lens memory usage: {num_bytes / 2 ** 20:.2f} MB in {lens_dtype}")
-
-        if self.bias_only:
-            logger.info("Freezing non-bias parameters (bias-only training).")
-            for probe in lens:
-                if isinstance(probe, torch.nn.Linear):
-                    probe.weight.requires_grad_(False)
-                    if probe.bias is not None:
-                        probe.bias.requires_grad_(True)
-                else:
-                    if hasattr(probe, "down"):
-                        probe.down.weight.requires_grad_(False)
-                    if hasattr(probe, "up"):
-                        probe.up.weight.requires_grad_(False)
-                    if hasattr(probe, "bias") and probe.bias is not None:
-                        probe.bias.requires_grad_(True)
         return lens
+
+    def get_lenses(self, model: PreTrainedModel) -> Dict[str, Lens]:
+        lenses: Dict[str, Lens] = {}
+        for hp in self.hook_points:
+            lens = self._make_single_lens(model)
+            if self.bias_only:
+                logger.info(f"[{hp}] Bias-only: freezing non-bias weights.")
+                for probe in lens:
+                    if isinstance(probe, torch.nn.Linear):
+                        probe.weight.requires_grad_(False)
+                        if probe.bias is not None:
+                            probe.bias.requires_grad_(True)
+                    else:
+                        if hasattr(probe, "down"):
+                            probe.down.weight.requires_grad_(False)
+                        if hasattr(probe, "up"):
+                            probe.up.weight.requires_grad_(False)
+                        if hasattr(probe, "bias") and probe.bias is not None:
+                            probe.bias.requires_grad_(True)
+            lenses[hp] = lens
+
+        total_bytes = 0
+        dtypes = set()
+        for lens in lenses.values():
+            for p in lens.parameters():
+                dtypes.add(p.dtype)
+                total_bytes += p.numel() * p.element_size() * (self.opt.per_parameter_optim_state_size() + 1)
+        logger.info(f"Combined lens memory: {total_bytes / 2**20:.2f} MB")
+        return lenses
 
     def _get_wandb_id(self) -> Optional[str]:
         if not self.dist.primary or not self.wandb:
@@ -170,7 +186,7 @@ class Train:
         from wandb.sdk.lib import runid
         return runid.generate_id()
 
-    def _init_logging(self, model_name: str, lens: TunedLens, wandb_id: Optional[str]):
+    def _init_logging(self, model_name: str, lenses: Dict[str, Lens], wandb_id: Optional[str]):
         if not self.dist.primary or not self.wandb:
             return
         logger.debug("Initializing Weights & Biases ...")
@@ -182,49 +198,48 @@ class Train:
             id=wandb_id,
             resume="allow",
         )
-        wandb.watch(lens)
+        for _, lens in lenses.items():
+            wandb.watch(lens)
 
     def _log(
         self,
         opt: torch.optim.Optimizer,
         step: int,
         losses: dict[str, list[float]],
-        tuned_lens: TunedLens,
+        lenses: Dict[str, Lens],
         nats_to_bpb: float,
     ):
         if not self.dist.primary or not self.wandb:
             return
         import wandb
         log_dict = {}
-        log_dict.update(
-            {f"loss/{k}": torch.tensor(v).mean() * nats_to_bpb for k, v in losses.items()}
-        )
-        for i, probe in enumerate(tuned_lens):
-            name = "input" if i == 0 else f"{i - 1}.ffn"
-            states = [opt.state[p] for p in probe.parameters()]
-            corr = 1 - self.opt.momentum**step
-            if self.opt.optimizer == "sgd" and not self.opt.zero:
-                log_dict["grad_norm/" + name] = torch.cat(
-                    [
+        log_dict.update({f"loss/{k}": torch.tensor(v).mean() * nats_to_bpb for k, v in losses.items()})
+        for hp, lens in lenses.items():
+            for i, probe in enumerate(lens):
+                name = f"{hp}:" + ("input" if i == 0 else f"{i - 1}.ffn")
+                states = [opt.state[p] for p in probe.parameters() if p in opt.state]
+                corr = 1 - getattr(self.opt, "momentum", 0.0)**step if hasattr(self.opt, "momentum") else 1.0
+                if getattr(self.opt, "optimizer", "") == "sgd" and not self.opt.zero:
+                    g = [
                         (1 - self.opt.momentum) * s["momentum_buffer"].flatten() / corr
-                        for s in states
-                        if "momentum_buffer" in s
+                        for s in states if "momentum_buffer" in s
                     ]
-                ).norm()
-            elif self.opt.optimizer == "adam" and not self.opt.zero:
-                log_dict["grad_norm/" + name] = torch.cat(
-                    [s["exp_avg"].flatten() / corr for s in states if "exp_avg" in s]
-                ).norm()
-            if isinstance(probe, torch.nn.Linear):
-                log_dict["bias_norm/" + name] = probe.bias.data.norm()
-                log_dict["weight_norm/" + name] = probe.weight.data.norm()
-            else:
-                if hasattr(probe, "down"):
-                    log_dict["down_weight_norm/" + name] = probe.down.weight.data.norm()
-                if hasattr(probe, "up"):
-                    log_dict["up_weight_norm/" + name] = probe.up.weight.data.norm()
-                if hasattr(probe, "bias") and probe.bias is not None:
+                elif getattr(self.opt, "optimizer", "") == "adam" and not self.opt.zero:
+                    g = [s["exp_avg"].flatten() / corr for s in states if "exp_avg" in s]
+                else:
+                    g = []
+                if g:
+                    log_dict["grad_norm/" + name] = torch.cat(g).norm()
+                if isinstance(probe, torch.nn.Linear):
                     log_dict["bias_norm/" + name] = probe.bias.data.norm()
+                    log_dict["weight_norm/" + name] = probe.weight.data.norm()
+                else:
+                    if hasattr(probe, "down"):
+                        log_dict["down_weight_norm/" + name] = probe.down.weight.data.norm()
+                    if hasattr(probe, "up"):
+                        log_dict["up_weight_norm/" + name] = probe.up.weight.data.norm()
+                    if hasattr(probe, "bias") and probe.bias is not None:
+                        log_dict["bias_norm/" + name] = probe.bias.data.norm()
         wandb.log(log_dict)
 
     def snapshot(self, state: State):
@@ -260,14 +275,11 @@ class Train:
         samples_per_step, rem = divmod(self.tokens_per_step, tokens_per_sample)
         if rem:
             raise ValueError(
-                f"Number of tokens per step ({self.tokens_per_step:_}) must be "
-                f"divisible by the number of tokens per sample ({tokens_per_sample})."
+                f"tokens_per_step ({self.tokens_per_step:_}) must be divisible by tokens_per_sample ({tokens_per_sample})."
             )
         if total_samples / samples_per_step < self.num_steps:
             raise ValueError(
-                f"Can only take {total_samples / samples_per_step:.2f} steps on "
-                f"dataset with --tokens_per_step={self.tokens_per_step}."
-                f"Requested {self.num_steps} steps."
+                f"Can only take {total_samples / samples_per_step:.2f} steps on dataset; requested {self.num_steps}."
             )
         global_batch_size = self.dist.per_gpu_batch_size * self.dist.world_size
         grad_acc_steps, rem = divmod(samples_per_step, global_batch_size)
@@ -275,29 +287,34 @@ class Train:
             grad_acc_steps += 1
             adjusted_count = grad_acc_steps * global_batch_size * tokens_per_sample
             logger.warning(
-                f"Note: Increasing grad acc steps from {grad_acc_steps - 1} to "
-                f"{grad_acc_steps} to maintain load balance across "
-                f"{self.dist.world_size} GPUs."
+                f"Increasing grad acc steps to {grad_acc_steps} for load balance across {self.dist.world_size} GPUs."
             )
             logger.warning(
-                f"Using {adjusted_count:_} tokens per training step "
-                f"({self.tokens_per_step:_} requested)."
+                f"Using {adjusted_count:_} tokens per step ({self.tokens_per_step:_} requested)."
             )
         else:
             logger.info(f"Gradient accumulation steps: {grad_acc_steps}")
             logger.info(f"Using {self.tokens_per_step:_} tokens per training step.")
         return grad_acc_steps
 
+    # ---- helper to save residual storage to subfolder (matches HookManager.save) ----
+    def _save_storage_list(self, base_dir: Path, hook_name: str, storage: List[torch.Tensor], tag: Optional[str]):
+        out_dir = base_dir / hook_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = f"__{tag}" if tag else ""
+        for i, tensor in enumerate(storage):
+            torch.save(tensor, out_dir / f"layer_{i}{suffix}.pt")
+
     def setup(self) -> tuple[State, Union[PreTrainedModel, FSDP], int]:
         self.dist.init()
-        model = tokenizer = data = lens = nats_to_bpb = None
+        model = tokenizer = data = lenses = nats_to_bpb = None
         load_device = self.dist.device if not self.dist.fsdp else None
 
         if self.dist.primary:
             logger.debug("Primary rank populating cache...")
             model, tokenizer = self.model.load(load_device)
             data, nats_to_bpb = self.data.load(tokenizer)
-            lens = self.get_lens(model)
+            lenses = self.get_lenses(model)
 
         self.dist.barrier()
 
@@ -305,24 +322,25 @@ class Train:
             logger.debug("Non-primary rank loading from cache...")
             model, tokenizer = self.model.load(load_device, must_use_cache=True)
             data, nats_to_bpb = self.data.load(tokenizer)
-            lens = self.get_lens(model)
+            lenses = self.get_lenses(model)
 
-        assert model and tokenizer and data and lens and nats_to_bpb
+        assert model and tokenizer and data and lenses and nats_to_bpb
 
-        logger.debug(f"Creating data loader and setting seed to {self.seed} ...")
         dl = self.dist.dataloader(data)
         dl.seed(self.seed)
-        logger.debug("Creating optimizer and scheduler ...")
-        params = [p for p in lens.parameters() if p.requires_grad]
+
+        params = [p for lens in lenses.values() for p in lens.parameters() if p.requires_grad]
         opt = self.opt.create_optim(params)
         scheduler = self.opt.create_scheduler(opt, self.num_steps)
 
-        ddp_lens = self.dist.distribute_lens(lens)
+        ddp_lenses: Dict[str, Lens] = {}
+        for k, lens in lenses.items():
+            ddp_lenses[k] = self.dist.distribute_lens(lens)
 
         state = State(
             step=0,
             wandb_id=self._get_wandb_id(),
-            lens=ddp_lens,  # type: ignore
+            lenses=ddp_lenses,  # type: ignore
             opt=opt,
             scheduler=scheduler,
             dataloader=dl,
@@ -333,19 +351,19 @@ class Train:
         model = self.dist.shard_model(model)
 
         self._init_logging(
-            model_name=self.model.name, lens=getattr(state.lens, "module", state.lens), wandb_id=state.wandb_id
+            model_name=self.model.name,
+            lenses={k: getattr(v, "module", v) for k, v in state.lenses.items()},
+            wandb_id=state.wandb_id,
         )
 
         tokens_per_sample = len(data[0]["input_ids"])
-        grad_acc_steps = self.calculate_gradient_accumulation_steps(
-            tokens_per_sample, len(data)
-        )
+        grad_acc_steps = self.calculate_gradient_accumulation_steps(tokens_per_sample, len(data))
 
         self.dist.barrier()
         logger.info("All processes have completed setup.")
         return state, model, grad_acc_steps
 
-    # -------- dtype parser ----------
+    # dtype parser
     def _to_dtype(self, name: str) -> torch.dtype:
         name = name.lower()
         if name in ("bf16", "bfloat16"):
@@ -354,41 +372,20 @@ class Train:
             return torch.float16
         if name in ("fp32", "float32"):
             return torch.float32
-        raise ValueError(f"Unrecognized dtype string for --offload-dtype: {name}")
+        raise ValueError(f"Unrecognized dtype for --offload-dtype: {name}")
 
-    # >>> CHUNKED TOP-K CHANGES: compute teacher only for a single time-chunk.
     @torch.no_grad()
-    def _teacher_topk_chunk(
-        self,
-        final_logits: torch.Tensor,  # (B, T, V) on GPU
-        t0: int,
-        t1: int,
-        shift: int,
-        k: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return teacher indices/logq for the [t0:t1) slice only.
-
-        Returns:
-            idx:  (B, tc, K) long (on CPU, pinned if possible)
-            logq: (B, tc, K) bf16 (on CPU, pinned if possible)
-        """
-        device = final_logits.device
-        logits_slice = final_logits[:, t0:t1].float()         # (B, tc, V) on GPU
-        vals, idx = logits_slice.topk(k=k, dim=-1)            # (B, tc, K)
-        # Apply shift before normalization
+    def _teacher_topk_chunk(self, final_logits: torch.Tensor, t0: int, t1: int, shift: int, k: int):
+        logits_slice = final_logits[:, t0:t1].float()
+        vals, idx = logits_slice.topk(k=k, dim=-1)
         vals = shift_labels(vals, shift).contiguous()
         idx  = shift_labels(idx,  shift).contiguous()
-        logq = vals - vals.logsumexp(-1, keepdim=True)        # (B, tc, K)
-
-        # Move to CPU to avoid holding on GPU between layers
+        logq = vals - vals.logsumexp(-1, keepdim=True)
         idx_cpu  = idx.to("cpu", dtype=torch.long, non_blocking=True, copy=True)
         logq_cpu = logq.to("cpu", dtype=torch.bfloat16, non_blocking=True, copy=True)
-
         if self.pin_memory_offload:
             idx_cpu  = idx_cpu.pin_memory()
             logq_cpu = logq_cpu.pin_memory()
-
-        # Cleanup GPU temporaries
         del logits_slice, vals, idx, logq
         return idx_cpu, logq_cpu
 
@@ -406,15 +403,9 @@ class Train:
         total_batches = self.num_steps * grad_acc_steps
 
         self.dist.barrier()
-        logger.info("All processes have completed setup. Starting training.")
+        logger.info("Starting training.")
 
-        t = trange(
-            init_batches,
-            total_batches,
-            desc="Training",
-            initial=init_batches,
-            total=total_batches,
-        )
+        t = trange(init_batches, total_batches, desc="Training", initial=init_batches, total=total_batches)
 
         running_loss_sum   = None
         running_loss_count = 0
@@ -422,152 +413,161 @@ class Train:
 
         offload_dtype = self._to_dtype(self.offload_dtype)
 
-        for batch_idx, batch in zip(t, state.dataloader):
-            # ----- forward pass (no grads) -----
-            with torch.no_grad():
-                batch = self.dist.send_to_device(batch)
-                output = model(**batch, output_hidden_states=True)
-                final_logits = output.logits  # (B, T, V)
+        hook_mgr = HookManager(
+            model=model if not isinstance(model, FSDP) else model.module,
+            hook_points=[hp for hp in self.hook_points if hp in ("attn_out", "mlp_out")],
+            offload_to_cpu=self.offload_hidden_to_cpu,
+            offload_dtype=offload_dtype,
+            pin_memory=self.pin_memory_offload,
+        )
+        hook_mgr.register()
 
-                # Stream / offload hidden states
-                if self.offload_hidden_to_cpu:
-                    hidden_storage: list[torch.Tensor] = []
-                    for h in output.hidden_states[:-1]:
-                        h_cpu = (
-                            h.detach()
-                            .to("cpu", dtype=offload_dtype, non_blocking=True, copy=True)
-                        )
-                        if self.pin_memory_offload:
-                            h_cpu = h_cpu.pin_memory()
-                        hidden_storage.append(h_cpu)
-                        del h
-                else:
-                    hidden_storage = list(output.hidden_states[:-1])
-                del output
+        try:
+            for batch_idx, batch in zip(t, state.dataloader):
+                # ----- forward (no grads) -----
+                with torch.no_grad():
+                    batch = self.dist.send_to_device(batch)
+                    output = model(**batch, output_hidden_states=("residual_out" in self.hook_points))
+                    final_logits = output.logits
 
-            # ----- teacher targets setup -----
-            if self.loss == LossChoice.CE:
-                shift  = 1 if self.token_shift is None else self.token_shift
-                labels = shift_labels(batch["input_ids"], shift).to(self.dist.device)
-            else:
-                shift = 0 if self.token_shift is None else self.token_shift
-
-            # >>> CHUNKED TOP-K CHANGES:
-            # time-major loop so each teacher chunk is computed once then reused across all layers
-            # Hidden states remain offloaded per layer; we fetch each layer slice per chunk.
-            B, T, _ = (hidden_storage[0].shape if hidden_storage else final_logits.shape)
-
-            for t0 in range(0, T, self.time_chunk):
-                t1 = min(t0 + self.time_chunk, T)
-
-                # Prepare teacher for this chunk (KL only). Keep on CPU, stream to GPU when used.
-                if self.loss == LossChoice.KL:
-                    idx_slice_cpu, logq_slice_cpu = self._teacher_topk_chunk(
-                        final_logits=final_logits,
-                        t0=t0,
-                        t1=t1,
-                        shift=shift,
-                        k=self.topk,
-                    )
-
-                # Loop over layers for this time-chunk
-                for i, h_store in enumerate(hidden_storage):
-                    if self.offload_hidden_to_cpu:
-                        h_slice = h_store[:, t0:t1].to(self.dist.device, non_blocking=True)
-                    else:
-                        h_slice = h_store[:, t0:t1]
-
-                    with torch.autocast(self.dist.device.type, dtype=torch.bfloat16):
-                        if self.loss == LossChoice.CE:
-                            logits_full = state.lens(h_slice, idx=i)  # (B, tc, V)
-                            preds_s     = shift_preds(logits_full, shift)
-                            loss_i      = torch.nn.functional.cross_entropy(
-                                preds_s.flatten(0, -2),
-                                labels[:, t0:t1].flatten(),
-                            )
-                            del logits_full, preds_s
+                    if "residual_out" in self.hook_points:
+                        if self.offload_hidden_to_cpu:
+                            residual_storage: List[torch.Tensor] = []
+                            for h in output.hidden_states[:-1]:
+                                h_cpu = h.detach().to("cpu", dtype=offload_dtype, non_blocking=True, copy=True)
+                                if self.pin_memory_offload:
+                                    h_cpu = h_cpu.pin_memory()
+                                residual_storage.append(h_cpu)
+                                del h
                         else:
-                            # Move teacher chunk to GPU just-in-time
-                            idx_slice  = idx_slice_cpu.to(self.dist.device, non_blocking=True)
-                            logq_slice = logq_slice_cpu.to(self.dist.device, dtype=torch.bfloat16, non_blocking=True)
-
-                            # Strict subset path — ensure lens never forms (B, tc, V)
-                            logits_k = state.lens(
-                                h_slice,
-                                idx=i,
-                                idx_subset=idx_slice,  # (B, tc, K)
-                            )
-                            preds_s = shift_preds(logits_k, shift)   # (B, tc, K)
-                            logp_k  = preds_s.log_softmax(-1)        # (B, tc, K)
-                            loss_i  = (logq_slice.exp() * (logq_slice - logp_k)).sum(-1).mean()
-                            del logits_k, preds_s, logp_k, idx_slice, logq_slice
-
-                    (loss_i / grad_acc_steps).backward()
-
-                    # running loss
-                    if running_loss_sum is None:
-                        running_loss_sum = loss_i.detach().float()
+                            residual_storage = list(output.hidden_states[:-1])
                     else:
-                        running_loss_sum += loss_i.detach().float()
-                    running_loss_count += 1
+                        residual_storage = []
 
-                    del h_slice  # free per-chunk, per-layer buffer
+                    attn_storage = hook_mgr.get_buffers("attn_out") if "attn_out" in self.hook_points else []
+                    mlp_storage  = hook_mgr.get_buffers("mlp_out")  if "mlp_out"  in self.hook_points else []
+                    del output
 
-                # free per-chunk teacher buffers (CPU tensors will be GC'd)
-                if self.loss == LossChoice.KL:
-                    del idx_slice_cpu, logq_slice_cpu
+                # optional on-disk dump of activations (per-hook subfolders)
+                if self.activations_dir is not None and self.dist.primary:
+                    tag = f"step{state.step}_batch{batch_idx}"
+                    # save hooked activations
+                    hook_mgr.save(self.activations_dir, tag=tag)
+                    # save residuals under residual_out/
+                    if "residual_out" in self.hook_points and residual_storage:
+                        self._save_storage_list(self.activations_dir, "residual_out", residual_storage, tag)
 
-            # end time-major loop
+                # ----- teacher targets -----
+                if self.loss == LossChoice.CE:
+                    shift  = 1 if self.token_shift is None else self.token_shift
+                    labels = shift_labels(batch["input_ids"], shift).to(self.dist.device)
+                else:
+                    shift = 0 if self.token_shift is None else self.token_shift
 
-            # Done with logits entirely
-            del final_logits
+                any_store = None
+                for st in (residual_storage, attn_storage, mlp_storage):
+                    if st:
+                        any_store = st
+                        break
+                if any_store is None:
+                    B, T, _ = final_logits.shape
+                else:
+                    B, T, _ = any_store[0].shape
 
-            # Free hidden state storage after this batch
-            if self.offload_hidden_to_cpu:
-                for h_store in hidden_storage:
-                    del h_store
-            del hidden_storage
+                # time-major loop w/ chunked teacher
+                for t0 in range(0, T, self.time_chunk):
+                    t1 = min(t0 + self.time_chunk, T)
+                    if self.loss == LossChoice.KL:
+                        idx_slice_cpu, logq_slice_cpu = self._teacher_topk_chunk(final_logits, t0, t1, shift, self.topk)
 
-            # ----- optimizer step on grad-acc boundary -----
-            step, rem = divmod(batch_idx, grad_acc_steps)
-            if rem == grad_acc_steps - 1:
-                torch.nn.utils.clip_grad_norm_(state.lens.parameters(), 1.0)
-                state.opt.step()
-                state.opt.zero_grad(set_to_none=True)
-                state.scheduler.step()
+                    hp_to_store = {
+                        "residual_out": residual_storage,
+                        "attn_out": attn_storage,
+                        "mlp_out": mlp_storage,
+                    }
+                    for hp in self.hook_points:
+                        store = hp_to_store.get(hp, [])
+                        if not store:
+                            continue
+                        lens = state.lenses[hp]
+                        for i, h_store in enumerate(store):
+                            h_slice = h_store[:, t0:t1].to(self.dist.device, non_blocking=True) \
+                                      if self.offload_hidden_to_cpu else h_store[:, t0:t1]
+                            with torch.autocast(self.dist.device.type, dtype=torch.bfloat16):
+                                if self.loss == LossChoice.CE:
+                                    logits_full = lens(h_slice, idx=i)
+                                    preds_s     = shift_preds(logits_full, shift)
+                                    loss_i      = torch.nn.functional.cross_entropy(
+                                        preds_s.flatten(0, -2),
+                                        labels[:, t0:t1].flatten(),
+                                    )
+                                    del logits_full, preds_s
+                                else:
+                                    idx_slice  = idx_slice_cpu.to(self.dist.device, non_blocking=True)
+                                    logq_slice = logq_slice_cpu.to(self.dist.device, dtype=torch.bfloat16, non_blocking=True)
+                                    logits_k = lens(h_slice, idx=i, idx_subset=idx_slice)
+                                    preds_s = shift_preds(logits_k, shift)
+                                    logp_k  = preds_s.log_softmax(-1)
+                                    loss_i  = (logq_slice.exp() * (logq_slice - logp_k)).sum(-1).mean()
+                                    del logits_k, preds_s, logp_k, idx_slice, logq_slice
 
-                local_mean  = (
-                    running_loss_sum / max(1, running_loss_count)
-                    if running_loss_sum is not None
-                    else torch.tensor(0.0, device=self.dist.device)
-                )
-                global_mean = maybe_all_reduce(local_mean)
-                mean_loss   = float(global_mean.item())
+                            (loss_i / grad_acc_steps).backward()
+                            running_loss_sum = (loss_i.detach().float()
+                                                if running_loss_sum is None
+                                                else running_loss_sum + loss_i.detach().float())
+                            running_loss_count += 1
+                            del h_slice
 
-                if self.dist.primary:
-                    postfix = {"avg_loss": f"{mean_loss * state.nats_to_bpb:.4f}"}
-                    if torch.cuda.is_available():
-                        peak_bytes = torch.cuda.max_memory_allocated()
-                        if peak_bytes > last_reported_peak_bytes:
-                            last_reported_peak_bytes = peak_bytes
+                    if self.loss == LossChoice.KL:
+                        del idx_slice_cpu, logq_slice_cpu
+
+                del final_logits
+
+                # free storages after batch
+                if self.offload_hidden_to_cpu:
+                    for h_store in residual_storage:
+                        del h_store
+                del residual_storage
+                hook_mgr.clear()
+
+                # optimizer step on grad-acc boundary
+                step, rem = divmod(batch_idx, grad_acc_steps)
+                if rem == grad_acc_steps - 1:
+                    for lens in state.lenses.values():
+                        torch.nn.utils.clip_grad_norm_(lens.parameters(), 1.0)
+                    state.opt.step()
+                    state.opt.zero_grad(set_to_none=True)
+                    state.scheduler.step()
+
+                    local_mean  = (running_loss_sum / max(1, running_loss_count)
+                                   if running_loss_sum is not None
+                                   else torch.tensor(0.0, device=self.dist.device))
+                    global_mean = maybe_all_reduce(local_mean)
+                    mean_loss   = float(global_mean.item())
+
+                    if self.dist.primary:
+                        postfix = {"avg_loss": f"{mean_loss * state.nats_to_bpb:.4f}"}
+                        if torch.cuda.is_available():
+                            peak_bytes = torch.cuda.max_memory_allocated()
                             postfix["peak_mem_GB"] = f"{peak_bytes / 1_073_741_824:.2f}"
-                    t.set_postfix(postfix)
-                    self._log(
-                        state.opt,
-                        step,
-                        {"avg": [mean_loss]},
-                        getattr(state.lens, "module", state.lens),
-                        state.nats_to_bpb,
-                    )
+                        t.set_postfix(postfix)
+                        self._log(state.opt, step, {"avg": [mean_loss]},
+                                  {k: getattr(v, "module", v) for k, v in state.lenses.items()},
+                                  state.nats_to_bpb)
 
-                running_loss_sum   = None
-                running_loss_count = 0
-                state.step         = step + 1
+                    running_loss_sum   = None
+                    running_loss_count = 0
+                    state.step         = step + 1
 
-                if (self.checkpoint_freq and
-                    step % self.checkpoint_freq == self.checkpoint_freq - 1):
-                    self.snapshot(state)
+                    if (self.checkpoint_freq and
+                        step % self.checkpoint_freq == self.checkpoint_freq - 1):
+                        self.snapshot(state)
+        finally:
+            hook_mgr.remove()
 
         if self.dist.primary:
-            logger.info(f"Saving lens to {self.output}")
-            getattr(state.lens, "module", state.lens).save(self.output)
+            logger.info(f"Saving lenses to {self.output}")
+            for hp, lens in state.lenses.items():
+                subdir = self.output / hp
+                subdir.mkdir(parents=True, exist_ok=True)
+                getattr(lens, "module", lens).save(subdir)

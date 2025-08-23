@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l walltime=00:05:00
+#PBS -q debug
+#PBS -l filesystems=home:grand:eagle
+#PBS -A SuperBERT
+#PBS -N tunedlens_eval_multihook
+
+# Move to the repo
+cd ~/../../grand/SuperBERT/pettyjohnjn/tuned-lens
+
+# Modules & env
+module use /soft/modulefiles
+module load conda
+# If needed on your system:
+# source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate tuned_lens_env
+
+# Optional caches (uncomment if useful)
+# export HF_HOME=/scratch/$USER/hf_cache
+# export TRANSFORMERS_CACHE=$HF_HOME
+
+python -m tuned_lens eval \
+    --data.name test \
+    --model.name gpt2 \
+    --tokens 16000 \
+    --lens_name my_lenses/gpt2/TunedLens \
+    --output evaluation/gpt2/TunedLens \
+   --hook_points residual_out attn_out mlp_out \
