@@ -149,3 +149,9 @@ pile/*_monology___pile-uncopyrighted_*/
 **/*.arrow
 **/*.lock
 **/*.incomplete_info.lock
+
+evaluation/*
+logs/*
+my_lenses/*
+tuned_lens/scripts/plots/*
+
