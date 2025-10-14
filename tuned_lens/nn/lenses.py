@@ -429,7 +429,7 @@ class _LowRankLinear(th.nn.Module):
         self.up = th.nn.Linear(rank, d_model, bias=False, dtype=dtype)
 
         # Initialize to zero so overall map starts as identity when used residually.
-        th.nn.init.zeros_(self.down.weight)
+        th.nn.init.xavier_uniform_(self.down.weight)
         th.nn.init.zeros_(self.up.weight)
 
         self.use_bias = bias
