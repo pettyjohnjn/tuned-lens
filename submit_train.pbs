@@ -34,3 +34,4 @@ torchrun \
     --lens-variant LORA \
     --lora-rank 4 \
     --precision bfloat16 \
+    --loss SUBSET_KL \

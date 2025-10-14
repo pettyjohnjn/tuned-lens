@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, TYPE_CHECKING
 
+import math
+
 from simple_parsing import field
 
 # Ensure 'ing' is present for runtime type evaluation by simple_parsing
@@ -49,6 +51,9 @@ class Train:
     loss: LossChoice = LossChoice.KL
     lens_variant: LensVariant = field(default=LensVariant.TUNED, alias=["--lens-variant"])
     lora_rank: int = field(default=16, alias=["--lora-rank"])
+
+    subset_topk: int = 256
+    subset_tail_proxy: bool = True
 
     def __post_init__(self):
         if self.checkpoint_dir is None:
@@ -337,9 +342,77 @@ class Train:
                 assert teacher_logprobs is not None
                 return loss_full_kl(preds, teacher_logprobs)
             elif loss_choice == LossChoice.SUBSET_KL:
-                raise NotImplementedError("Subset-KL not implemented yet.")
+                # raise NotImplementedError("Subset-KL not implemented yet.")
+                assert teacher_logprobs is not None
+                
+                if self.subset_tail_proxy:
+                    return topk_with_tail_proxy_kl(preds, teacher_logprobs, self.subset_topk)
             else:
                 raise ValueError(f"Unknown loss {loss_choice}")
+
+        def topk_with_tail_proxy_kl(
+            preds: th.Tensor,            # [B,T,V] student logits (z)
+            teacher_logprobs: th.Tensor, # [B,T,V] log P from teacher
+            k: int,
+        ) -> th.Tensor:
+            """Deterministic Top-K + single tail proxy. Mask-free and numerically stable."""
+            assert k > 0
+            z = preds.float()                 # keep Stage-B math in fp32
+            logP = teacher_logprobs.float()
+            B, T, V = z.shape
+            k = min(k, V)
+            n_tail = V - k
+            eps = 1e-20
+
+            # Top-K by teacher probability
+            idx = th.topk(logP, k=k, dim=-1, sorted=False).indices          # [B,T,K]
+            logP_sub = logP.gather(-1, idx)                                  # [B,T,K]
+            P_sub = logP_sub.exp()                                           # [B,T,K]
+            z_sub = z.gather(-1, idx)                                        # [B,T,K]
+
+            # Teacher tail mass (exact)
+            P_tail = (1.0 - P_sub.sum(dim=-1, keepdim=True)).clamp_min(0.0)  # [B,T,1]
+
+            # Stable log-sum-exp for tail: log(exp(lse_all) - exp(lse_sub))
+            lse_all = th.logsumexp(z, dim=-1, keepdim=True)                  # [B,T,1]
+            lse_sub = th.logsumexp(z_sub, dim=-1, keepdim=True)              # [B,T,1]
+            m = th.maximum(lse_all, lse_sub)                                 # [B,T,1]
+
+            # Compute in higher precision to avoid underflow, then clamp and cast back
+            t64 = (lse_all.double() - m.double()).exp() - (lse_sub.double() - m.double()).exp()
+            t = t64.clamp_min(1e-300).float()                                # [B,T,1]
+            log_tail_sumexp = m + t.log()                                    # [B,T,1]
+
+            # Tail proxy logit
+            if n_tail == 0:
+                z_tail_proxy = th.full_like(log_tail_sumexp, float("-inf"))
+            else:
+                z_tail_proxy = log_tail_sumexp - math.log(n_tail)            # [B,T,1]
+
+            # Augment student distribution with tail proxy and compute logQ over K+1 outcomes
+            aug_z = th.cat([z_sub, z_tail_proxy], dim=-1)                    # [B,T,K+1]
+            logQ_aug = th.log_softmax(aug_z, dim=-1)                         # [B,T,K+1]
+
+            # Augmented teacher probabilities (K exact tokens + exact tail mass)
+            logP_tail = P_tail.clamp_min(eps).log()
+            P_aug = th.cat([P_sub, P_tail], dim=-1)                          # [B,T,K+1]
+            logP_aug = th.cat([logP_sub, logP_tail], dim=-1)                 # [B,T,K+1]
+
+            # Mask tail where P_tail == 0
+            tail_mask = th.cat([th.ones_like(P_sub, dtype=th.bool), (P_tail > 0)], dim=-1)
+            P_aug = th.where(tail_mask, P_aug, th.zeros_like(P_aug))
+            logP_aug = th.where(tail_mask, logP_aug, th.zeros_like(logP_aug))
+
+            # KL = E_{P_aug}[log P_aug - log Q_aug]
+            kl = (P_aug * (logP_aug - logQ_aug)).sum(dim=-1).mean()
+
+            # Fallback: pure Top-K truncated KL if non-finite (should not trigger)
+            if not th.isfinite(kl):
+                logP_sub_n = logP_sub - th.logsumexp(logP_sub, dim=-1, keepdim=True)
+                P_sub_n = logP_sub_n.exp()
+                logQ_sub_n = th.log_softmax(z_sub, dim=-1)
+                kl = (P_sub_n * (logP_sub_n - logQ_sub_n)).sum(dim=-1).mean()
+            return kl
 
         state, model, grad_acc_steps = self.setup()
 
@@ -383,7 +456,7 @@ class Train:
                 ce_labels = shift_labels(batch["input_ids"], shift)
                 teacher_logprobs = None
             else:
-                teacher_logprobs = final_logits.float().log_softmax(dim=-1).to(th.bfloat16)
+                teacher_logprobs = final_logits.float().log_softmax(dim=-1)
                 shift = 0 if self.token_shift is None else self.token_shift
                 teacher_logprobs = shift_labels(teacher_logprobs, shift)
                 ce_labels = None
