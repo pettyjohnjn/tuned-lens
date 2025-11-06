@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -l select=1
-#PBS -l walltime=00:05:00
+#PBS -l walltime=00:60:00
 #PBS -q debug
 #PBS -l filesystems=home:grand:eagle
 #PBS -A SuperBERT
@@ -30,8 +30,7 @@ torchrun \
     --model.name gpt2 \
     --data.name val \
     --per_gpu_batch_size=20 \
-    --output my_lenses/gpt2-Tuned-Lens \
-    --lens-variant LORA \
-    --lora-rank 4 \
+    --output my_lenses/gpt2-Tuned-Lens-IS-Tail \
     --precision bfloat16 \
     --loss SUBSET_KL \
+    --lens_variant TUNED \

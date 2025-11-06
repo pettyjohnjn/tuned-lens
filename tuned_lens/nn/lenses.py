@@ -47,6 +47,19 @@ class Lens(abc.ABC, th.nn.Module):
         """Decode hidden states into logits."""
         ...
 
+    def forward_subset(self, h: th.Tensor, idx: int, token_idx: th.Tensor) -> th.Tensor:
+        """Decode hidden states into logits for a per-position subset of tokens.
+
+        Args:
+            h: [B,T,d] hidden states.
+            idx: layer index.
+            token_idx: [B,T,K] integer token ids per position.
+
+        Returns:
+            [B,T,K] logits for the requested token indices.
+        """
+        raise NotImplementedError
+
 
 class LogitLens(Lens):
     """Unembeds the residual stream into logits."""
@@ -91,6 +104,17 @@ class LogitLens(Lens):
         """
         del idx
         return self.unembed.forward(h)
+
+    def forward_subset(self, h: th.Tensor, idx: int, token_idx: th.Tensor) -> th.Tensor:
+        """Subset logits for requested token indices."""
+        del idx
+        if token_idx.numel() == 0:
+            return token_idx.new_empty(*token_idx.shape)
+        if hasattr(self.unembed, "forward_subset"):
+            return self.unembed.forward_subset(h, token_idx)
+        # Fallback: full logits then gather
+        logits = self.unembed.forward(h)
+        return logits.gather(-1, token_idx)
 
 
 @dataclass
@@ -160,10 +184,12 @@ class TunedLens(Lens):
         translator = th.nn.Linear(
             config.d_model, config.d_model, bias=config.bias, dtype=dtype
         )
-        translator.weight.data.zero_()
-        translator.bias.data.zero_()
+        with th.no_grad():
+            translator.weight.zero_()
+            if translator.bias is not None:
+                translator.bias.zero_()
 
-        # Don't include the final layer since it does not need a translator
+        # One translator per layer. The final layer's translator may be unused.
         self.layer_translators = th.nn.ModuleList(
             [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
         )
@@ -275,6 +301,7 @@ class TunedLens(Lens):
         th_load_kwargs = {
             **{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}
         }
+        th_load_kwargs.setdefault("map_location", "cpu")
         # Load parameters
         state = th.load(ckpt_path, **th_load_kwargs)
 
@@ -305,15 +332,23 @@ class TunedLens(Lens):
 
     def transform_hidden(self, h: th.Tensor, idx: int) -> th.Tensor:
         """Transform hidden state from layer `idx`."""
-        # Note that we add the translator output residually, in contrast to the formula
-        # in the paper. By parametrizing it this way we ensure that weight decay
-        # regularizes the transform toward the identity, not the zero transformation.
+        # Residual parameterization regularizes toward identity under weight decay.
         return h + self[idx](h)
 
     def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
         """Transform and then decode the hidden states into logits."""
         h = self.transform_hidden(h, idx)
         return self.unembed.forward(h)
+
+    def forward_subset(self, h: th.Tensor, idx: int, token_idx: th.Tensor) -> th.Tensor:
+        """Subset logits for requested token indices."""
+        h = self.transform_hidden(h, idx)
+        if token_idx.numel() == 0:
+            return token_idx.new_empty(*token_idx.shape)
+        if hasattr(self.unembed, "forward_subset"):
+            return self.unembed.forward_subset(h, token_idx)
+        logits = self.unembed.forward(h)
+        return logits.gather(-1, token_idx)
 
     def __len__(self) -> int:
         """Return the number of layer translators in the lens."""
@@ -381,6 +416,7 @@ class TunedLens(Lens):
                 break
 
         return tokens
+
 
 @dataclass
 class LoraLensConfig:
@@ -476,7 +512,7 @@ class LoraLens(Lens):
             dtype=dtype,
         )
 
-        # Don't include the final layer since it does not need a translator
+        # One translator per layer. The final layer's translator may be unused.
         self.layer_translators = th.nn.ModuleList(
             [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
         )
@@ -554,6 +590,7 @@ class LoraLens(Lens):
         lens = cls(unembed, config)
 
         th_load_kwargs = {**{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}}
+        th_load_kwargs.setdefault("map_location", "cpu")
         state = th.load(ckpt_path, **th_load_kwargs)
 
         lens.layer_translators.load_state_dict(state)
@@ -582,6 +619,16 @@ class LoraLens(Lens):
         """Transform and then decode the hidden states into logits."""
         h = self.transform_hidden(h, idx)
         return self.unembed.forward(h)
+
+    def forward_subset(self, h: th.Tensor, idx: int, token_idx: th.Tensor) -> th.Tensor:
+        """Subset logits for requested token indices."""
+        h = self.transform_hidden(h, idx)
+        if token_idx.numel() == 0:
+            return token_idx.new_empty(*token_idx.shape)
+        if hasattr(self.unembed, "forward_subset"):
+            return self.unembed.forward_subset(h, token_idx)
+        logits = self.unembed.forward(h)
+        return logits.gather(-1, token_idx)
 
     def __len__(self) -> int:
         return len(self.layer_translators)

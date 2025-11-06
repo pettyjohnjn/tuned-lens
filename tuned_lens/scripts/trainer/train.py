@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, TYPE_CHECKING
 
-import math
-
 from simple_parsing import field
 
 # Ensure 'ing' is present for runtime type evaluation by simple_parsing
@@ -23,7 +21,7 @@ from .constants import GRAD_CLIP_NORM
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:  # only for static typing
+if TYPE_CHECKING:
     from transformers import PreTrainedModel
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
 
@@ -32,7 +30,6 @@ if TYPE_CHECKING:  # only for static typing
 class Train:
     """Training loop for the tuned lens."""
 
-    # Use string annotations to avoid importing types eagerly.
     model: "ing.Model"
     data: "ing.Data"
     opt: "ing.Optimizer"
@@ -52,26 +49,31 @@ class Train:
     lens_variant: LensVariant = field(default=LensVariant.TUNED, alias=["--lens-variant"])
     lora_rank: int = field(default=16, alias=["--lora-rank"])
 
-    subset_topk: int = 256
-    subset_tail_proxy: bool = True
+    # Stage A config
+    subset_topk: int = 256  # head size (K_head)
+
+    # Head–tail subset KL knobs
+    tail_k: int = 64                 # samples from tail per (B,T)
+    tail_clip: float = 50.0          # cap on importance ratios
+    self_normalize_tail: bool = True
+    tail_proposal: str = field(default="uniform", alias=["--tail-proposal"])  # "uniform"|"teacher"
+    tail_oversample: int = field(default=4, alias=["--tail-oversample"])      # candidate multiplier M=k*oversample
 
     def __post_init__(self):
         if self.checkpoint_dir is None:
             self.checkpoint_dir = self.output / "checkpoints"
 
-    # ---------- WandB helpers (lazy imports) ----------
+    # ---------- WandB helpers ----------
     def _get_wandb_id(self) -> Optional[str]:
         if not self.dist.primary or not self.wandb:
             return None
         from wandb.sdk.lib import runid  # lazy
-
         return runid.generate_id()
 
     def _init_logging(self, model_name: str, lens, wandb_id: Optional[str]) -> None:
         if not self.dist.primary or not self.wandb:
             return
         import wandb  # lazy
-
         logger.debug("Initializing Weights & Biases ...")
         wandb.init(
             config=dataclasses.asdict(self),
@@ -163,6 +165,7 @@ class Train:
         if self.bias_only:
             logger.info("Freezing non-bias parameters (bias-only training).")
             for probe in lens:
+                import torch as th
                 if isinstance(probe, th.nn.Linear):
                     probe.weight.requires_grad_(False)
                     if probe.bias is not None:
@@ -310,23 +313,154 @@ class Train:
         from tqdm.auto import trange  # lazy
         from tuned_lens.utils import maybe_all_reduce, shift_labels, shift_preds  # lazy
 
-        # ---- Local helpers: seam for future subset-KL ----
-        def teacher_stats_from_logits(final_logits: th.Tensor):
-            """
-            Inputs: final_logits [B, T, V]
-            Returns: P[bfloat16], logP[float32], H(P)[scalar]
-            """
-            logP = final_logits.float().log_softmax(dim=-1)
-            P = logP.exp().to(th.bfloat16)
-            H = (-(P.float() * logP).sum(dim=-1)).mean()
-            return P, logP, H
-
+        # ---- helpers ----
         def loss_ce(preds: th.Tensor, labels: th.Tensor) -> th.Tensor:
             return th.nn.functional.cross_entropy(preds.flatten(0, -2), labels.flatten())
 
         def loss_full_kl(preds: th.Tensor, teacher_logprobs: th.Tensor) -> th.Tensor:
             logq = preds.log_softmax(-1)
             return th.sum(teacher_logprobs.exp() * (teacher_logprobs - logq), dim=-1).mean()
+
+        def _lens_forward_subset(h_shifted: th.Tensor, layer_idx: int, idx: th.Tensor) -> th.Tensor:
+            lens_mod = getattr(state.lens, "module", state.lens)  # unwrap DDP/FSDP
+            return lens_mod.forward_subset(h_shifted, layer_idx, idx)
+
+        # ---- head–tail subset KL (deterministic head + sampled tail) ----
+        def _gather_topk(logP: th.Tensor, k: int):
+            k = min(k, logP.size(-1))
+            idx = th.topk(logP, k=k, dim=-1, sorted=False).indices  # [B,T,k]
+            logP_sub = logP.gather(-1, idx)                         # [B,T,k]
+            return idx, logP_sub
+
+        def _sample_tail_uniform_excluding(idx_head: th.Tensor, vocab_size: int, k: int) -> th.Tensor:
+            """
+            Uniform sampling from tail = vocab \ head. Vectorized fast path with a rare slow fallback.
+            idx_head: [B,T,K_h] -> returns [B,T,k]
+            """
+            B, T, K = idx_head.shape
+            V = vocab_size
+            k = min(k, max(1, V - K))
+
+            def draw(kdraw: int) -> th.Tensor:
+                return th.randint(low=0, high=V, size=(B, T, kdraw), device=idx_head.device)
+
+            cand = draw(k * 2)
+            neq = cand.unsqueeze(-1) != idx_head.unsqueeze(-2)  # [B,T,2k,K_h]
+            not_head = neq.all(dim=-1)                          # [B,T,2k]
+            cand_masked = th.where(not_head, cand, th.full_like(cand, -1))
+            valid = (cand_masked >= 0).int()
+            topk_valid = th.topk(valid, k=k, dim=-1).indices
+            tail_idx = cand_masked.gather(-1, topk_valid)
+            if (tail_idx < 0).any():
+                # slow fallback
+                tail_idx_list = []
+                for b in range(B):
+                    row = []
+                    for t in range(T):
+                        head_set = set(idx_head[b, t].tolist())
+                        out = []
+                        while len(out) < k:
+                            x = int(th.randint(0, V, ()).item())
+                            if x not in head_set:
+                                out.append(x)
+                        row.append(out)
+                    tail_idx_list.append(row)
+                tail_idx = th.tensor(tail_idx_list, device=idx_head.device, dtype=th.long)
+            return tail_idx
+
+        def _sample_tail_teacher_biased(
+            idx_head: th.Tensor,
+            logP: th.Tensor,      # [B,T,V] teacher log-probs
+            k: int,               # k_tail
+            oversample: int,      # candidate multiplier
+        ) -> tuple[th.Tensor, th.Tensor]:
+            """
+            Returns:
+              tail_idx: [B,T,k] vocab indices from tail
+              q_sel:    [B,T,k] proposal probabilities for selected indices
+            Proposal: sample a small uniform candidate set from tail, then
+            sample with replacement from that set proportional to teacher probs.
+            """
+            import torch as th
+            B, T, K_h = idx_head.shape
+            V = logP.size(-1)
+            tail_size = max(0, V - K_h)
+            if tail_size == 0:
+                # Degenerate case: no tail
+                empty = th.zeros(B, T, k, device=idx_head.device, dtype=th.long)
+                q_zero = th.full_like(empty, 1.0 / max(1, k), dtype=logP.dtype)
+                return empty, q_zero
+
+            M = min(max(k, 1) * max(1, oversample), tail_size)
+            cand = _sample_tail_uniform_excluding(idx_head, V, M)       # [B,T,M]
+
+            logP_C = logP.gather(-1, cand).float()                      # [B,T,M]
+            logZ_C = th.logsumexp(logP_C, dim=-1, keepdim=True)         # [B,T,1]
+            q_C = th.exp(logP_C - logZ_C).clamp_min(1e-12)              # [B,T,M]
+
+            q_flat = q_C.reshape(B * T, M)
+            sel_in_c = th.multinomial(q_flat, num_samples=k, replacement=True)  # [B*T,k]
+            sel_in_c = sel_in_c.view(B, T, k)
+
+            tail_idx = cand.gather(-1, sel_in_c)                        # [B,T,k]
+            q_sel = q_C.gather(-1, sel_in_c)                            # [B,T,k]
+            return tail_idx, q_sel
+
+        def head_tail_subset_kl(
+            h_shifted: th.Tensor,
+            layer_idx: int,
+            teacher_logprobs: th.Tensor,
+            k_head: int,
+            k_tail: int,
+            tail_clip: float,
+            self_norm: bool,
+        ) -> th.Tensor:
+            """
+            Head: exact subset KL on top-k_head (renormalized within head).
+            Tail: self-normalized importance-sampled subset KL on k_tail with selectable proposal.
+            """
+            logP = teacher_logprobs.float()                # [B,T,V]
+            V = logP.size(-1)
+
+            # Head deterministic term
+            idxH, logP_H = _gather_topk(logP, k_head)      # [B,T,K_h], [B,T,K_h]
+            z_H = _lens_forward_subset(h_shifted, layer_idx, idxH).float()  # [B,T,K_h]
+            logP_Hn = logP_H - th.logsumexp(logP_H, dim=-1, keepdim=True)
+            P_Hn = logP_Hn.exp()
+            logQ_Hn = th.log_softmax(z_H, dim=-1)
+            head_kl = th.sum(P_Hn * (logP_Hn - logQ_Hn), dim=-1)            # [B,T]
+
+            # Tail sampled term
+            if self.tail_proposal == "teacher":
+                idxT, q_sel = _sample_tail_teacher_biased(idxH, logP, k_tail, self.tail_oversample)
+                logP_T = logP.gather(-1, idxT)                              # [B,T,K_t]
+                z_T = _lens_forward_subset(h_shifted, layer_idx, idxT).float()
+                w = (logP_T.exp() / q_sel).clamp_min(1e-12)                 # IS ratios under teacher-biased q
+            elif self.tail_proposal == "uniform":
+                idxT = _sample_tail_uniform_excluding(idxH, V, k_tail)      # [B,T,K_t]
+                logP_T = logP.gather(-1, idxT)
+                z_T = _lens_forward_subset(h_shifted, layer_idx, idxT).float()
+                tail_size = max(1, V - idxH.size(-1))
+                q = 1.0 / tail_size                                         # uniform over tail
+                w = (logP_T.exp() / q)
+            else:
+                raise ValueError(f"Unknown tail_proposal {self.tail_proposal}")
+
+            if tail_clip is not None and tail_clip > 0:
+                w = th.clamp(w, max=tail_clip)
+
+            if self_norm:
+                w_sum = w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                w_sn = w / w_sum
+            else:
+                w_sn = w / float(k_tail)
+
+            logP_Tn = logP_T - th.logsumexp(logP_T, dim=-1, keepdim=True)
+            logQ_Tn = th.log_softmax(z_T, dim=-1)
+            tail_term = th.sum(w_sn * (logP_Tn - logQ_Tn), dim=-1)           # [B,T]
+
+            loss_bt = head_kl + tail_term
+            return loss_bt.mean()
 
         def compute_loss(
             preds: th.Tensor,
@@ -342,77 +476,10 @@ class Train:
                 assert teacher_logprobs is not None
                 return loss_full_kl(preds, teacher_logprobs)
             elif loss_choice == LossChoice.SUBSET_KL:
-                # raise NotImplementedError("Subset-KL not implemented yet.")
-                assert teacher_logprobs is not None
-                
-                if self.subset_tail_proxy:
-                    return topk_with_tail_proxy_kl(preds, teacher_logprobs, self.subset_topk)
+                # handled in per-layer branch
+                raise RuntimeError("SUBSET_KL handled in per-layer branch.")
             else:
                 raise ValueError(f"Unknown loss {loss_choice}")
-
-        def topk_with_tail_proxy_kl(
-            preds: th.Tensor,            # [B,T,V] student logits (z)
-            teacher_logprobs: th.Tensor, # [B,T,V] log P from teacher
-            k: int,
-        ) -> th.Tensor:
-            """Deterministic Top-K + single tail proxy. Mask-free and numerically stable."""
-            assert k > 0
-            z = preds.float()                 # keep Stage-B math in fp32
-            logP = teacher_logprobs.float()
-            B, T, V = z.shape
-            k = min(k, V)
-            n_tail = V - k
-            eps = 1e-20
-
-            # Top-K by teacher probability
-            idx = th.topk(logP, k=k, dim=-1, sorted=False).indices          # [B,T,K]
-            logP_sub = logP.gather(-1, idx)                                  # [B,T,K]
-            P_sub = logP_sub.exp()                                           # [B,T,K]
-            z_sub = z.gather(-1, idx)                                        # [B,T,K]
-
-            # Teacher tail mass (exact)
-            P_tail = (1.0 - P_sub.sum(dim=-1, keepdim=True)).clamp_min(0.0)  # [B,T,1]
-
-            # Stable log-sum-exp for tail: log(exp(lse_all) - exp(lse_sub))
-            lse_all = th.logsumexp(z, dim=-1, keepdim=True)                  # [B,T,1]
-            lse_sub = th.logsumexp(z_sub, dim=-1, keepdim=True)              # [B,T,1]
-            m = th.maximum(lse_all, lse_sub)                                 # [B,T,1]
-
-            # Compute in higher precision to avoid underflow, then clamp and cast back
-            t64 = (lse_all.double() - m.double()).exp() - (lse_sub.double() - m.double()).exp()
-            t = t64.clamp_min(1e-300).float()                                # [B,T,1]
-            log_tail_sumexp = m + t.log()                                    # [B,T,1]
-
-            # Tail proxy logit
-            if n_tail == 0:
-                z_tail_proxy = th.full_like(log_tail_sumexp, float("-inf"))
-            else:
-                z_tail_proxy = log_tail_sumexp - math.log(n_tail)            # [B,T,1]
-
-            # Augment student distribution with tail proxy and compute logQ over K+1 outcomes
-            aug_z = th.cat([z_sub, z_tail_proxy], dim=-1)                    # [B,T,K+1]
-            logQ_aug = th.log_softmax(aug_z, dim=-1)                         # [B,T,K+1]
-
-            # Augmented teacher probabilities (K exact tokens + exact tail mass)
-            logP_tail = P_tail.clamp_min(eps).log()
-            P_aug = th.cat([P_sub, P_tail], dim=-1)                          # [B,T,K+1]
-            logP_aug = th.cat([logP_sub, logP_tail], dim=-1)                 # [B,T,K+1]
-
-            # Mask tail where P_tail == 0
-            tail_mask = th.cat([th.ones_like(P_sub, dtype=th.bool), (P_tail > 0)], dim=-1)
-            P_aug = th.where(tail_mask, P_aug, th.zeros_like(P_aug))
-            logP_aug = th.where(tail_mask, logP_aug, th.zeros_like(logP_aug))
-
-            # KL = E_{P_aug}[log P_aug - log Q_aug]
-            kl = (P_aug * (logP_aug - logQ_aug)).sum(dim=-1).mean()
-
-            # Fallback: pure Top-K truncated KL if non-finite (should not trigger)
-            if not th.isfinite(kl):
-                logP_sub_n = logP_sub - th.logsumexp(logP_sub, dim=-1, keepdim=True)
-                P_sub_n = logP_sub_n.exp()
-                logQ_sub_n = th.log_softmax(z_sub, dim=-1)
-                kl = (P_sub_n * (logP_sub_n - logQ_sub_n)).sum(dim=-1).mean()
-            return kl
 
         state, model, grad_acc_steps = self.setup()
 
@@ -450,27 +517,39 @@ class Train:
             hidden_states = output.hidden_states[:-1]
             del output
 
-            # Unify teacher prep and label shifting
             if self.loss == LossChoice.CE:
                 shift = 1 if self.token_shift is None else self.token_shift
                 ce_labels = shift_labels(batch["input_ids"], shift)
                 teacher_logprobs = None
+                del final_logits
             else:
-                teacher_logprobs = final_logits.float().log_softmax(dim=-1)
+                teacher_logprobs = final_logits.float().log_softmax(dim=-1).to(th.bfloat16)
                 shift = 0 if self.token_shift is None else self.token_shift
                 teacher_logprobs = shift_labels(teacher_logprobs, shift)
                 ce_labels = None
-            del final_logits
+                del final_logits
 
             for i, h in enumerate(hidden_states):
                 with th.autocast(self.dist.device.type, dtype=th.bfloat16):
-                    preds = shift_preds(state.lens(h, idx=i), shift)
-                    loss_i = compute_loss(
-                        preds,
-                        self.loss,
-                        ce_labels=ce_labels,
-                        teacher_logprobs=teacher_logprobs,
-                    )
+                    if self.loss == LossChoice.SUBSET_KL:
+                        h_shift = shift_preds(h, shift)
+                        loss_i = head_tail_subset_kl(
+                            h_shift,
+                            i,
+                            teacher_logprobs,
+                            k_head=self.subset_topk,
+                            k_tail=self.tail_k,
+                            tail_clip=self.tail_clip,
+                            self_norm=self.self_normalize_tail,
+                        )
+                    else:
+                        preds = shift_preds(state.lens(h, idx=i), shift)
+                        loss_i = compute_loss(
+                            preds,
+                            self.loss,
+                            ce_labels=ce_labels,
+                            teacher_logprobs=teacher_logprobs,
+                        )
 
                 (loss_i / grad_acc_steps).backward()
 
